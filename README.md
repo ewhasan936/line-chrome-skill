@@ -22,10 +22,10 @@ any agent or shell script), and then just ask in plain language:
 
 | You say | What happens |
 | --- | --- |
-| "Tell 김용진 I'll be 5 minutes late" | Finds the chat, types, sends — verified delivered |
+| "Tell Alex I'll be 5 minutes late" | Finds the chat, types, sends — verified delivered |
 | "What did I miss in the team room?" | Reads recent messages and reports back |
 | "Summarize today's conversation in the Family group" | Pulls history and summarizes it |
-| "Find the address Yongjin sent me yesterday" | Searches a room's messages for a keyword |
+| "Find the address Alex sent me yesterday" | Searches a room's messages for a keyword |
 | "Tell me when someone replies in the project room" | Watches for new incoming messages |
 
 ### Meaningful scenarios
@@ -98,7 +98,7 @@ python3 cli.py diagnose                   # check every selector against the liv
 python3 cli.py list-rooms --limit 50
 python3 cli.py list-contacts --limit 50
 
-python3 cli.py send --to "홍길동" --text "Hello"
+python3 cli.py send --to "Alex" --text "Hello"
 python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "meeting"
 python3 cli.py watch --interval 5         # poll for new messages (Ctrl-C to stop)
