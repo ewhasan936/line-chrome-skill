@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "extension_id": "ophjlpahpchlmihnnnihgmmeilfjmjjc",
+  "extension_url_prefix": "chrome-extension://ophjlpahpchlmihnnnihgmmeilfjmjjc/",
+  "leveldb_path_template": "~/Library/Application Support/Google/Chrome/{profile}/IndexedDB/chrome-extension_ophjlpahpchlmihnnnihgmmeilfjmjjc_0.indexeddb.leveldb",
+  "selectors": {
+    "search_input":            "input[placeholder*='検索'], input[placeholder*='검색'], input[placeholder*='Search'], input[type='search']",
+    "chat_list_container":     "[class*=\"chatlist-module__chatlist_inner__\"]",
+    "chat_list_item":          "[class*=\"chatlistItem-module__chatlist_item__\"]",
+    "chat_list_item_name":     "[class*=\"chatlistItem-module__title_box__\"]",
+    "chat_room_header":        "[class*=\"chatroomHeader-module__name__\"]",
+    "message_input":           "[class*=\"chatroomEditor-module__textarea__\"], textarea-ex.text",
+    "send_button":             "button[aria-label*='送信'], button[aria-label*='Send'], button[aria-label*='보내기'], button[type='submit']",
+    "message_list_container":  "div.message_list, [role=\"log\"]",
+    "message_bubble":          "[class*=\"messageLayout-module__message__\"]",
+    "message_author":          "[class*='Author'], [class*='SenderName']",
+    "message_text":            "[class*=\"messageLayout-module__content__\"]",
+    "message_timestamp":       "[class*=\"metaInfo-module__meta__\"] time, time[datetime]"
+  },
+  "notes": [
+    "These selectors target the LINE Chrome extension (ophjlpahpchlmihnnnihgmmeilfjmjjc). Nine keys were verified against a live DOM; search_input / send_button / message_author keep generic fallbacks.",
+    "If LINE ships an extension update and a selector breaks, fix it without code changes:",
+    "1) Open the LINE extension window in Chrome, then open DevTools (right-click > Inspect).",
+    "2) Inspect the broken element and pick a stable selector (prefer role/aria/data-testid > class > tag).",
+    "3) Add an override with the same key in ~/.config/line-chrome/selectors.json,",
+    "   or pass --selector key=value on the CLI for a one-off override.",
+    "4) Run `python3 cli.py diagnose` to confirm every selector matches.",
+    "Selector priority: CLI --selector > user override (~/.config/line-chrome/selectors.json) > this file."
+  ]
+}
