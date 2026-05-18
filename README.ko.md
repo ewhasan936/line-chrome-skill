@@ -52,6 +52,10 @@ LINE 확장은 Chrome 탭 안에서 일반 웹페이지로 렌더링됩니다. `
 
 ## 사전 준비
 
+![별도 창으로 분리한 LINE Chrome 확장](docs/line-window.png)
+
+*별도 Chrome 창으로 분리한 LINE 확장 — 이 도구가 조작하는 대상 상태입니다.*
+
 1. **LINE Chrome 확장 설치**
    <https://chromewebstore.google.com/detail/line/ophjlpahpchlmihnnnihgmmeilfjmjjc>
 2. **한 번 로그인** — 확장 아이콘을 클릭해 QR로 로그인. 이 단계는 절대 자동화하지

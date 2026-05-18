@@ -54,6 +54,10 @@ externalized in `selectors.json` so a LINE update can be repaired without code c
 
 ## Prerequisites
 
+![The LINE Chrome extension detached into its own window](docs/line-window.png)
+
+*The LINE extension detached into its own Chrome window — the state this tool drives.*
+
 1. **Install the LINE Chrome extension**
    <https://chromewebstore.google.com/detail/line/ophjlpahpchlmihnnnihgmmeilfjmjjc>
 2. **Log in once** — click the extension icon and sign in via QR. Never automate this

@@ -54,6 +54,10 @@ LINE 拡張機能は Chrome タブ内で通常の Web ページとしてレン�
 
 ## 前提条件
 
+![独立したウィンドウに切り離した LINE Chrome 拡張機能](docs/line-window.png)
+
+*独立した Chrome ウィンドウに切り離した LINE 拡張機能 —— このツールが操作する対象の状態です。*
+
 1. **LINE Chrome 拡張機能をインストール**
    <https://chromewebstore.google.com/detail/line/ophjlpahpchlmihnnnihgmmeilfjmjjc>
 2. **一度ログイン** —— 拡張機能のアイコンをクリックし QR でサインイン。この手順は
