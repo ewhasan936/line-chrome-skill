@@ -103,6 +103,7 @@ python3 cli.py list-contacts --limit 50
 python3 cli.py send --to "홍길동" --text "안녕하세요"
 python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "회의"
+python3 cli.py leave-group --room "Old Group" --confirm   # 되돌릴 수 없음 — 아래 참고
 python3 cli.py watch --interval 5         # 새 메시지 폴링 (Ctrl-C로 중지)
 
 python3 cli.py selectors show
@@ -123,6 +124,28 @@ System Events로 `보기 → 개발자 정보 → Apple Events의 자바스크�
 
 참고: Chrome은 이 설정을 AppleScript로 **끄는** 것은 차단합니다 — 켜는 방향만
 자동화 가능하며, 이 명령에는 그것으로 충분합니다.
+
+### `leave-group`
+
+그룹에서 영구히 나갑니다. **되돌릴 수 없습니다** — 한 번 나가면 스스로 다시
+참여할 수 없고, 그룹의 현재 멤버가 다시 초대해 줘야 합니다.
+
+그래서 `leave-group`은 2단계 확인을 거칩니다:
+
+1. 먼저 `--confirm` **없이** 실행합니다. 파괴적 동작은 일어나지 않고,
+   `reason: "confirmation_required"`와 `warning`을 반환합니다:
+   ```sh
+   python3 cli.py leave-group --room "Old Group"
+   ```
+2. 경고를 확인하고 정말 나갈지 결정한 뒤, `--confirm`을 **붙여** 다시 실행합니다:
+   ```sh
+   python3 cli.py leave-group --room "Old Group" --confirm
+   ```
+
+이 명령은 동작 전에 열린 채팅방 헤더가 `--room`과 일치하는지 검증하고, 메뉴나 확인
+모달이 예상대로 나타나지 않으면 파괴적 단계 **이전에** 중단합니다. AI 어시스턴트가
+대신 실행하는 경우, `--confirm`을 붙이기 전에 경고를 사용자에게 보여주고 명시적인
+동의("그룹을 나가면 다시 참여할 수 없습니다. 진행하시겠습니까?")를 받아야 합니다.
 
 ## 깨진 selector 고치기
 

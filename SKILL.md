@@ -36,6 +36,7 @@ python3 cli.py list-contacts
 python3 cli.py send --to "홍길동" --text "안녕"
 python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "회의"
+python3 cli.py leave-group --room "Old Group" --confirm   # irreversible — see below
 python3 cli.py watch --interval 5         # poll for new messages
 python3 cli.py selectors show
 python3 cli.py selectors set message_input "textarea-ex.text"
@@ -44,6 +45,31 @@ python3 cli.py cache-dump --out ~/line-cache-copy
 ```
 
 All commands print JSON to stdout.
+
+## Leaving a group (`leave-group`)
+
+`leave-group` permanently removes the user from a group. **This is irreversible** —
+once left, the user cannot rejoin on their own; a current member must invite them
+back. Treat it as a destructive action.
+
+**Mandatory confirmation step.** When the user asks to leave a group:
+
+1. First run **without** `--confirm`:
+   ```
+   python3 cli.py leave-group --room "Old Group"
+   ```
+   This does nothing destructive — it returns `reason: "confirmation_required"`
+   with a `warning` field.
+2. Show that warning to the user and get an **explicit yes**, e.g. ask
+   "그룹을 나가면 다시 참여할 수 없습니다. 진행하시겠습니까?".
+3. Only after the user explicitly agrees, run again **with** `--confirm`:
+   ```
+   python3 cli.py leave-group --room "Old Group" --confirm
+   ```
+
+Never pass `--confirm` on the first call or without an explicit user yes. The
+command verifies the chatroom header matches `--room` before acting and aborts
+before the destructive step if the menu or confirmation modal does not appear.
 
 ## Fixing broken selectors
 

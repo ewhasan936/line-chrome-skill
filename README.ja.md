@@ -105,6 +105,7 @@ python3 cli.py list-contacts --limit 50
 python3 cli.py send --to "山田太郎" --text "こんにちは"
 python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "会議"
+python3 cli.py leave-group --room "Old Group" --confirm   # 取り消し不可 — 下記参照
 python3 cli.py watch --interval 5         # 新着メッセージをポーリング (Ctrl-C で停止)
 
 python3 cli.py selectors show
@@ -125,6 +126,28 @@ Events 経由で `表示 → デベロッパー → Apple Events からの JavaS
 
 注: Chrome はこの設定を AppleScript で**オフにする**ことをブロックします —— オンに
 する方向のみ自動化可能で、このコマンドにはそれで十分です。
+
+### `leave-group`
+
+グループから完全に退出します。**取り消しできません** —— 一度退出すると自分では
+再参加できず、グループの現メンバーに招待し直してもらう必要があります。
+
+そのため `leave-group` は 2 段階の確認を行います:
+
+1. まず `--confirm` **なし**で実行します。破壊的な動作は起きず、
+   `reason: "confirmation_required"` と `warning` を返します:
+   ```sh
+   python3 cli.py leave-group --room "Old Group"
+   ```
+2. 警告を読み、本当に退出するか確認したうえで、`--confirm` を**付けて**再実行します:
+   ```sh
+   python3 cli.py leave-group --room "Old Group" --confirm
+   ```
+
+このコマンドは動作前に開いているチャットルームのヘッダーが `--room` と一致するか
+検証し、メニューや確認モーダルが想定どおり表示されない場合は破壊的ステップの**前に**
+中止します。AI アシスタントが代行する場合は、`--confirm` を付ける前に警告をユーザーに
+提示し、明示的な同意を得る必要があります。
 
 ## 壊れたセレクタの修正
 

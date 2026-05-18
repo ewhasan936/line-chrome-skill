@@ -1172,6 +1172,223 @@ def cmd_enable_applescript(args, sel, sources):
             "post_state": post["state"]}
 
 
+def cmd_leave_group(args, sel, sources):
+    """Leave a LINE group. Destructive and irreversible — requires --confirm.
+    Navigates to the room, verifies the chatroom header matches the requested
+    name, then drives the header menu → Leave → confirmation modal."""
+    if not args.room:
+        raise SkillError("--room is required")
+    if not args.confirm:
+        return {
+            "ok": False,
+            "reason": "confirmation_required",
+            "room": args.room,
+            "warning": (
+                "Leaving a group is permanent. Once you leave you cannot rejoin on "
+                "your own — a current member must invite you back."
+            ),
+            "next_step": (
+                "Show this warning to the user and get an explicit yes "
+                "(e.g. \"그룹을 나가면 다시 참여할 수 없습니다. "
+                "진행하시겠습니까?\"), then re-run with --confirm."
+            ),
+        }
+
+    loc = _require_tab()
+    nav = _navigate_to_room(sel, loc, args.room)
+    if not nav.get("ok"):
+        return {"ok": False, "stage": "navigate", "reason": nav}
+
+    win_id = loc.get("window_id")
+    tab_id = loc.get("tab_id")
+
+    def esc(js):
+        return js.replace("\\", "\\\\").replace('"', '\\"')
+
+    hdr_sel = json.dumps(sel.get("chat_room_header"), ensure_ascii=False)
+    js_header = (
+        f"(function(){{var h=document.querySelector({hdr_sel});"
+        "return h?(h.textContent||'').trim():'';})()"
+    )
+    # Open the header "more" menu. Idempotent: clicking the button toggles the
+    # popover, so we only click when it is not already open — never closing one.
+    # The popover renders asynchronously; the caller polls js_pop_check afterwards.
+    js_more = (
+        "(function(){"
+        "var h=document.querySelector('[class*=\"chatroomHeader-module\"]');"
+        "if(!h)return JSON.stringify({ok:false,reason:'no_header'});"
+        "var b=h.querySelector('button[class*=\"button_more\"]');"
+        "if(!b)return JSON.stringify({ok:false,reason:'no_more_button'});"
+        "var pop=document.querySelector('[class*=\"actionPopoverLayout-module__popover_wrap__\"]');"
+        "if(pop)return JSON.stringify({ok:true,already_open:true});"
+        "b.click();return JSON.stringify({ok:true,clicked:true});"
+        "})()"
+    )
+    js_pop_check = (
+        "(function(){"
+        "var p=document.querySelector('[class*=\"actionPopoverLayout-module__popover_wrap__\"]');"
+        "return JSON.stringify({present:!!p});"
+        "})()"
+    )
+    # Click the "Leave" item inside the popover. Match by keyword substring so it
+    # works across LINE UI languages: "Leave" / "그룹 나가기" / "グループを退会".
+    js_leave = (
+        "(function(){"
+        "var pop=document.querySelector('[class*=\"actionPopoverLayout-module__popover_wrap__\"]');"
+        "if(!pop)return JSON.stringify({ok:false,reason:'no_popover'});"
+        "var btns=pop.querySelectorAll('button[class*=\"button_action\"]');"
+        "var kws=['Leave','나가기','退会','退出'];"
+        "var lb=null;"
+        "for(var i=0;i<btns.length;i++){var bt=(btns[i].textContent||'').trim();"
+        "for(var k=0;k<kws.length;k++){if(bt.indexOf(kws[k])>=0){lb=btns[i];break;}}"
+        "if(lb)break;}"
+        "if(!lb)return JSON.stringify({ok:false,reason:'no_leave_item',"
+        "items:Array.from(btns).map(function(b){return (b.textContent||'').trim();})});"
+        "lb.click();return JSON.stringify({ok:true});"
+        "})()"
+    )
+    js_modal = (
+        "(function(){"
+        "var m=document.querySelector('[class*=\"alertModal-module__modal__\"]');"
+        "if(!m)return JSON.stringify({present:false});"
+        "return JSON.stringify({present:true,text:(m.textContent||'').trim()});"
+        "})()"
+    )
+    js_confirm = (
+        "(function(){"
+        "var m=document.querySelector('[class*=\"alertModal-module__modal__\"]');"
+        "if(!m)return JSON.stringify({ok:false,reason:'no_modal'});"
+        "var b=m.querySelector('button[class*=\"alertModal-module__button_confirm\"]');"
+        "if(!b)return JSON.stringify({ok:false,reason:'no_confirm_button'});"
+        "b.click();return JSON.stringify({ok:true});"
+        "})()"
+    )
+    js_final = (
+        f"(function(){{var m=document.querySelector('[class*=\"alertModal-module__modal__\"]');"
+        f"var h=document.querySelector({hdr_sel});"
+        "return JSON.stringify({modalPresent:!!m,header:h?(h.textContent||'').trim():''});})()"
+    )
+
+    room_lit = args.room.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'set jsHeader to "{esc(js_header)}"\n'
+        f'set jsMore to "{esc(js_more)}"\n'
+        f'set jsPopCheck to "{esc(js_pop_check)}"\n'
+        f'set jsLeave to "{esc(js_leave)}"\n'
+        f'set jsModal to "{esc(js_modal)}"\n'
+        f'set jsConfirm to "{esc(js_confirm)}"\n'
+        f'set jsFinal to "{esc(js_final)}"\n'
+        f'tell application "Google Chrome"\n'
+        f'  set targetTab to missing value\n'
+        f'  repeat with w in windows\n'
+        f'    if (id of w as integer) is {win_id} then\n'
+        f'      repeat with t in tabs of w\n'
+        f'        if (id of t as integer) is {tab_id} then\n'
+        f'          set targetTab to t\n'
+        f'          exit repeat\n'
+        f'        end if\n'
+        f'      end repeat\n'
+        f'    end if\n'
+        f'    if targetTab is not missing value then exit repeat\n'
+        f'  end repeat\n'
+        f'  if targetTab is missing value then return "ABORT_NO_TAB"\n'
+        f'  -- Poll for the chatroom header to settle on the target group.\n'
+        f'  set headerText to ""\n'
+        f'  set matched to false\n'
+        f'  repeat 30 times\n'
+        f'    delay 0.1\n'
+        f'    set headerText to execute targetTab javascript jsHeader\n'
+        f'    if headerText is not "" then\n'
+        f'      if (headerText contains "{room_lit}") or ("{room_lit}" contains headerText) then\n'
+        f'        set matched to true\n'
+        f'        exit repeat\n'
+        f'      end if\n'
+        f'    end if\n'
+        f'  end repeat\n'
+        f'  if not matched then return "ABORT_WRONG_ROOM:" & headerText\n'
+        f'  set moreJson to execute targetTab javascript jsMore\n'
+        f'  -- The popover renders asynchronously; poll for it, re-clicking once if needed.\n'
+        f'  set popReady to false\n'
+        f'  repeat 20 times\n'
+        f'    delay 0.15\n'
+        f'    if (execute targetTab javascript jsPopCheck) contains "\\"present\\":true" then\n'
+        f'      set popReady to true\n'
+        f'      exit repeat\n'
+        f'    end if\n'
+        f'  end repeat\n'
+        f'  if not popReady then\n'
+        f'    execute targetTab javascript jsMore\n'
+        f'    repeat 20 times\n'
+        f'      delay 0.15\n'
+        f'      if (execute targetTab javascript jsPopCheck) contains "\\"present\\":true" then\n'
+        f'        set popReady to true\n'
+        f'        exit repeat\n'
+        f'      end if\n'
+        f'    end repeat\n'
+        f'  end if\n'
+        f'  if not popReady then return "ABORT_NO_POPOVER:" & moreJson\n'
+        f'  set leaveJson to execute targetTab javascript jsLeave\n'
+        f'  delay 0.6\n'
+        f'  set modalJson to execute targetTab javascript jsModal\n'
+        f'  -- Only confirm if a leave-confirmation modal is actually showing.\n'
+        f'  if modalJson does not contain "\\"present\\":true" then return "ABORT_NO_MODAL:" & modalJson\n'
+        f'  if (modalJson does not contain "eave") and (modalJson does not contain "退") and (modalJson does not contain "나") then return "ABORT_MODAL_MISMATCH:" & modalJson\n'
+        f'  set confirmJson to execute targetTab javascript jsConfirm\n'
+        f'  delay 1.0\n'
+        f'  set finalJson to execute targetTab javascript jsFinal\n'
+        f'  return headerText & "@@1@@" & moreJson & "@@2@@" & leaveJson & "@@3@@" & modalJson & "@@4@@" & confirmJson & "@@5@@" & finalJson\n'
+        f'end tell'
+    )
+    try:
+        raw = _osascript(script, timeout=20)
+    except SkillError as e:
+        return {"ok": False, "stage": "osascript", "reason": str(e)}
+
+    if raw == "ABORT_NO_TAB":
+        return {"ok": False, "stage": "locate_tab", "reason": "extension tab not found"}
+    if raw.startswith("ABORT_WRONG_ROOM:"):
+        return {"ok": False, "stage": "verify_room", "reason": "chatroom header did not match",
+                "requested": args.room, "header": raw[len("ABORT_WRONG_ROOM:"):]}
+    if raw.startswith("ABORT_NO_POPOVER:"):
+        return {"ok": False, "stage": "open_menu", "reason": "header menu popover did not appear",
+                "detail": raw[len("ABORT_NO_POPOVER:"):]}
+    if raw.startswith("ABORT_NO_MODAL:"):
+        return {"ok": False, "stage": "confirm_modal", "reason": "leave confirmation modal did not appear",
+                "detail": raw[len("ABORT_NO_MODAL:"):]}
+    if raw.startswith("ABORT_MODAL_MISMATCH:"):
+        return {"ok": False, "stage": "confirm_modal", "reason": "modal text was not a group-leave confirmation",
+                "detail": raw[len("ABORT_MODAL_MISMATCH:"):]}
+    if "@@1@@" not in raw:
+        return {"ok": False, "stage": "unknown", "raw": raw[:300]}
+
+    header_part, rest = raw.split("@@1@@", 1)
+    more_part, rest = rest.split("@@2@@", 1)
+    leave_part, rest = rest.split("@@3@@", 1)
+    modal_part, rest = rest.split("@@4@@", 1)
+    confirm_part, final_part = rest.split("@@5@@", 1)
+
+    def _j(s):
+        try:
+            return json.loads(s)
+        except Exception:
+            return {}
+
+    more_info, leave_info = _j(more_part), _j(leave_part)
+    confirm_info, final_info = _j(confirm_part), _j(final_part)
+    if not more_info.get("ok"):
+        return {"ok": False, "stage": "open_menu", "detail": more_info, "header": header_part}
+    if not leave_info.get("ok"):
+        return {"ok": False, "stage": "click_leave", "detail": leave_info, "header": header_part}
+    if not confirm_info.get("ok"):
+        return {"ok": False, "stage": "confirm", "detail": confirm_info, "header": header_part}
+
+    left = not final_info.get("modalPresent") and final_info.get("header", "") != header_part
+    return {"ok": bool(left), "room": args.room, "header_before": header_part,
+            "header_after": final_info.get("header", ""),
+            "verified": left,
+            "note": None if left else "confirm was clicked but the chat still shows the group; verify manually"}
+
+
 def cmd_status(args, sel, sources):
     info = {
         "chrome_running": chrome_running(),
@@ -1421,6 +1638,11 @@ def main():
     sd.add_argument("--to", required=True)
     sd.add_argument("--text", required=True)
 
+    lg = sub.add_parser("leave-group")
+    lg.add_argument("--room", required=True)
+    lg.add_argument("--confirm", action="store_true",
+                    help="Required. Leaving a group is irreversible.")
+
     h = sub.add_parser("history")
     h.add_argument("--room", required=True)
     h.add_argument("--limit", type=int, default=30)
@@ -1451,6 +1673,7 @@ def main():
         "enable-applescript": cmd_enable_applescript,
         "list-rooms": cmd_list_rooms, "list-contacts": cmd_list_contacts,
         "send": cmd_send, "history": cmd_history, "search": cmd_search,
+        "leave-group": cmd_leave_group,
         "watch": cmd_watch,
         "selectors": cmd_selectors,
         "cache-info": cmd_cache_info, "cache-dump": cmd_cache_dump,

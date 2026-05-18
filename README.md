@@ -105,6 +105,7 @@ python3 cli.py list-contacts --limit 50
 python3 cli.py send --to "Alex" --text "Hello"
 python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "meeting"
+python3 cli.py leave-group --room "Old Group" --confirm   # irreversible — see below
 python3 cli.py watch --interval 5         # poll for new messages (Ctrl-C to stop)
 
 python3 cli.py selectors show
@@ -125,6 +126,29 @@ accidentally toggles it back off.
 
 Note: Chrome blocks turning this setting **off** via AppleScript — only the on
 direction is automatable, which is all this command needs.
+
+### `leave-group`
+
+Permanently removes you from a group. **This is irreversible** — once you leave you
+cannot rejoin on your own; a current member has to invite you back.
+
+Because of that, `leave-group` uses a two-step confirmation:
+
+1. Run it first **without** `--confirm`. Nothing destructive happens — it returns
+   `reason: "confirmation_required"` plus a `warning`:
+   ```sh
+   python3 cli.py leave-group --room "Old Group"
+   ```
+2. Read the warning, make sure you really want to leave, then run again **with**
+   `--confirm`:
+   ```sh
+   python3 cli.py leave-group --room "Old Group" --confirm
+   ```
+
+The command verifies the open chatroom header matches `--room` before doing
+anything, and aborts before the destructive step if the menu or the confirmation
+modal does not appear as expected. If an AI assistant runs this for you, it should
+show you the warning and get an explicit yes before passing `--confirm`.
 
 ## Fixing broken selectors
 
