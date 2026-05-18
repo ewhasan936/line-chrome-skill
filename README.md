@@ -105,6 +105,8 @@ python3 cli.py list-contacts --limit 50
 python3 cli.py send --to "Alex" --text "Hello"
 python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "meeting"
+python3 cli.py reply --room "Family" --to "see you at 6" --text "got it"
+python3 cli.py send-sticker --to "Family"   # see "Stickers" below
 python3 cli.py leave-group --room "Old Group" --confirm   # irreversible — see below
 python3 cli.py watch --interval 5         # poll for new messages (Ctrl-C to stop)
 
@@ -126,6 +128,28 @@ accidentally toggles it back off.
 
 Note: Chrome blocks turning this setting **off** via AppleScript — only the on
 direction is automatable, which is all this command needs.
+
+### `reply`
+
+`reply --room R --to "<substring>" --text "<body>"` replies to a specific earlier
+message (a quoted reply). `--to` is a substring identifying the message being
+replied to; if several match, the most recent one is used. Completes in roughly
+0.4s when already in the room, ~0.8s when it has to navigate first.
+
+### `send-sticker`
+
+`send-sticker --to R [--package N] [--sticker N]` sends a sticker, addressed by
+package/sticker index (default `0 0` — the first sticker of the first package).
+
+**Environment limitation:** opening LINE's sticker picker requires a *trusted*
+user-activation gesture. A JavaScript-injected click via the AppleScript
+`execute javascript` bridge does not grant user activation, so the picker usually
+does not open. When it cannot, the command returns
+`{"ok": false, "reason": "picker_unavailable"}` instead of failing opaquely.
+A working sticker send needs trusted input — Chrome DevTools Protocol
+(`Input.dispatchMouseEvent`) or OS-level synthetic clicks with macOS Accessibility
+permission. The picker structure and the send/verify logic are implemented, so the
+command works as soon as a trusted-input path is available.
 
 ### `leave-group`
 

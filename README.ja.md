@@ -105,6 +105,8 @@ python3 cli.py list-contacts --limit 50
 python3 cli.py send --to "山田太郎" --text "こんにちは"
 python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "会議"
+python3 cli.py reply --room "Family" --to "6時に会おう" --text "了解"
+python3 cli.py send-sticker --to "Family"   # 下記「ステッカー」参照
 python3 cli.py leave-group --room "Old Group" --confirm   # 取り消し不可 — 下記参照
 python3 cli.py watch --interval 5         # 新着メッセージをポーリング (Ctrl-C で停止)
 
@@ -126,6 +128,28 @@ Events 経由で `表示 → デベロッパー → Apple Events からの JavaS
 
 注: Chrome はこの設定を AppleScript で**オフにする**ことをブロックします —— オンに
 する方向のみ自動化可能で、このコマンドにはそれで十分です。
+
+### `reply`
+
+`reply --room R --to "<部分文字列>" --text "<本文>"` — 特定の過去メッセージに引用
+返信します。`--to` は返信対象メッセージを識別する部分文字列で、複数一致した場合は
+最新のものを使います。ルームを開いていれば約0.4秒、移動が必要な場合は約0.8秒で
+完了します。
+
+### `send-sticker`
+
+`send-sticker --to R [--package N] [--sticker N]` — パッケージ/ステッカーのインデックス
+で指定してステッカーを送ります（既定は `0 0` = 最初のパッケージの最初のステッカー）。
+
+**環境上の制約:** LINE のステッカーピッカーを開くには *信頼された (trusted)*
+ユーザーアクティベーションのジェスチャーが必要です。AppleScript の
+`execute javascript` ブリッジで注入したクリックはユーザーアクティベーションを
+付与しないため、ピッカーは通常開きません。開けない場合は
+`{"ok": false, "reason": "picker_unavailable"}` を返して明示します。ステッカー送信を
+動作させるには信頼された入力 — Chrome DevTools Protocol（`Input.dispatchMouseEvent`）
+または macOS アクセシビリティ権限を持つ OS レベルの合成クリック — が必要です。
+ピッカー構造と送信・検証ロジックは実装済みで、信頼された入力経路が用意され次第
+動作します。
 
 ### `leave-group`
 

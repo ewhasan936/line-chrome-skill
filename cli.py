@@ -1490,6 +1490,469 @@ def cmd_send(args, sel, sources):
     return send_result
 
 
+def _js_find_message_contextmenu(target: str) -> str:
+    """Find the most recent message bubble whose text contains `target` and open its
+    context menu (right-click). Returns ok + the matched text, or a not-found reason."""
+    return (
+        "(function(){"
+        f"var TARGET={json.dumps(target, ensure_ascii=False)};"
+        "var msgs=document.querySelectorAll('[class*=\"messageLayout-module__message__\"]');"
+        "var hit=null,hitText='',bestTs=-1;"
+        "for(var i=0;i<msgs.length;i++){"
+        "var tn=msgs[i].querySelector('[class*=\"textMessageContent-module__text__\"]');"
+        "if(tn&&(tn.textContent||'').indexOf(TARGET)>=0){"
+        "var ts=parseInt(msgs[i].getAttribute('data-timestamp')||'0',10)||0;"
+        "if(ts>=bestTs){bestTs=ts;hit=msgs[i];hitText=tn.textContent;}"
+        "}"
+        "}"
+        "if(!hit)return JSON.stringify({ok:false,reason:'message_not_found'});"
+        "var cw=hit.querySelector('[class*=\"textMessageContent-module__content_wrap__\"]')"
+        "||hit.querySelector('[class*=\"textMessageContent-module__text__\"]');"
+        "if(!cw)return JSON.stringify({ok:false,reason:'no_content_wrap'});"
+        "var r=cw.getBoundingClientRect();"
+        "var o={bubbles:true,cancelable:true,composed:true,clientX:r.left+r.width/2,clientY:r.top+r.height/2,button:2};"
+        "cw.dispatchEvent(new MouseEvent('mouseover',o));"
+        "cw.dispatchEvent(new MouseEvent('mousemove',o));"
+        "cw.dispatchEvent(new MouseEvent('contextmenu',o));"
+        "return JSON.stringify({ok:true,matched:hitText.slice(0,80)});"
+        "})()"
+    )
+
+
+def _js_context_menu_present() -> str:
+    """Report whether the message context menu is currently rendered."""
+    return (
+        "(function(){return JSON.stringify({present:!!("
+        "document.querySelector('[class*=\"actionPopoverList-module__action_list__\"]')"
+        "||document.querySelector('[class*=\"actionPopoverLayout-module__popover_wrap__\"]'))});})()"
+    )
+
+
+def _js_click_reply_item() -> str:
+    """Inside the open context menu, click the Reply item (EN/KO/JA labels)."""
+    return (
+        "(function(){"
+        "var pop=document.querySelector('[class*=\"actionPopoverList-module__action_list__\"]')"
+        "||document.querySelector('[class*=\"actionPopoverLayout-module__popover_wrap__\"]');"
+        "if(!pop)return JSON.stringify({ok:false,reason:'no_context_menu'});"
+        "var btns=pop.querySelectorAll('button[class*=\"actionPopoverListItem-module__button_action__\"]');"
+        "var kws=['Reply','답장','返信'];"
+        "var rb=null;"
+        "for(var i=0;i<btns.length;i++){var t=(btns[i].textContent||'').trim();"
+        "for(var k=0;k<kws.length;k++){if(t.indexOf(kws[k])>=0){rb=btns[i];break;}}}"
+        "if(!rb)return JSON.stringify({ok:false,reason:'no_reply_item',"
+        "items:Array.from(btns).map(function(b){return (b.textContent||'').trim();})});"
+        "rb.click();return JSON.stringify({ok:true});"
+        "})()"
+    )
+
+
+def _js_reply_state(text: str) -> str:
+    """Report reply-compose state: whether the quote banner is present, and whether a
+    sent reply bubble containing `text` exists. Used for both pre-type and post-send checks."""
+    return (
+        "(function(){"
+        f"var TEXT={json.dumps(text, ensure_ascii=False)};"
+        "var banner=document.querySelector('[class*=\"replyTargetMessage-module__reply_target_message__\"]');"
+        "var msgs=document.querySelectorAll('[class*=\"messageLayout-module__message__\"]');"
+        "var sent=false;"
+        "for(var i=0;i<msgs.length;i++){"
+        "var rc=msgs[i].querySelector('[class*=\"replyMessageContent-module__reply_content__\"]');"
+        "var c=msgs[i].querySelector('[class*=\"messageLayout-module__content__\"]');"
+        "if(rc&&c&&(c.textContent||'').indexOf(TEXT)>=0)sent=true;"
+        "}"
+        "return JSON.stringify({bannerPresent:!!banner,replySent:sent});"
+        "})()"
+    )
+
+
+def _do_reply(sel: dict, loc: dict, target: str, text: str,
+              nav_room: str = None, nav_query: str = None) -> dict:
+    """Run the full reply sequence in one osascript: (optional navigate) -> contextmenu
+    -> Reply -> verify quote banner -> type -> Enter -> poll for the sent reply bubble.
+    When nav_room is given, navigation is folded into the same osascript (cold path)."""
+    win_id = loc.get("window_id")
+    tab_id = loc.get("tab_id")
+
+    def esc(js):
+        return js.replace("\\", "\\\\").replace('"', '\\"')
+
+    def wrap(js):
+        wrapped = (
+            "(function(){try{var r=(function(){" + js
+            + "})();return (typeof r==='string')?r:JSON.stringify(r);}"
+            "catch(e){return JSON.stringify({error:String(e&&e.message||e)});}})()"
+        )
+        return wrapped.replace("\\", "\\\\").replace('"', '\\"')
+
+    hdr_sel = json.dumps(sel.get("chat_room_header"), ensure_ascii=False)
+    header_js = f"(function(){{var h=document.querySelector({hdr_sel});return h?(h.textContent||'').trim():'';}})()"
+
+    find_esc = esc(_js_find_message_contextmenu(target))
+    menu_esc = esc(_js_context_menu_present())
+    reply_esc = esc(_js_click_reply_item())
+    mode_esc = esc(_js_reply_state(text))
+    type_esc = esc(_js_type_only(sel, text))
+    enter_esc = esc(_js_enter_only(sel))
+    state_esc = esc(_js_reply_state(text))
+    header_esc = esc(header_js)
+
+    # Cold path: fold search -> click -> header-settle into the same osascript.
+    nav_block = ""
+    nav_setup = ""
+    if nav_room:
+        cli_sel = json.dumps(sel.get("chat_list_item"), ensure_ascii=False)
+        name_sel = json.dumps(sel.get("chat_list_item_name"), ensure_ascii=False)
+        filter_js = (
+            "(function(){"
+            f"var items=document.querySelectorAll({cli_sel});"
+            f"var ROOM={json.dumps(nav_room, ensure_ascii=False)};var mc=0;"
+            "for(var i=0;i<items.length;i++){"
+            f"var n=(items[i].querySelector({name_sel})?.textContent||'').trim();"
+            "if(n===ROOM||n.indexOf(ROOM)>=0||ROOM.indexOf(n)>=0)mc++;}"
+            "return JSON.stringify({matchCount:mc});})()"
+        )
+        room_lit = nav_room.replace("\\", "\\\\").replace('"', '\\"')
+        nav_setup = (
+            f'set jsSet to "{wrap(js_set_search(sel, nav_query or nav_room))}"\n'
+            f'set jsClick to "{wrap(js_click_room_in_list(sel, nav_room))}"\n'
+            f'set jsFilter to "{esc(filter_js)}"\n'
+        )
+        nav_block = (
+            f'  execute targetTab javascript jsSet\n'
+            f'  set filterReady to false\n'
+            f'  repeat 50 times\n'
+            f'    delay 0.03\n'
+            f'    if (execute targetTab javascript jsFilter) does not contain "\\"matchCount\\":0" then\n'
+            f'      set filterReady to true\n'
+            f'      exit repeat\n'
+            f'    end if\n'
+            f'  end repeat\n'
+            f'  if not filterReady then return "ABORT_NAV@@filter_timeout"\n'
+            f'  execute targetTab javascript jsClick\n'
+            f'  set navOk to false\n'
+            f'  repeat 50 times\n'
+            f'    delay 0.03\n'
+            f'    set hh to execute targetTab javascript jsHeader\n'
+            f'    if hh is not "" then\n'
+            f'      if (hh contains "{room_lit}") or ("{room_lit}" contains hh) then\n'
+            f'        set navOk to true\n'
+            f'        exit repeat\n'
+            f'      end if\n'
+            f'    end if\n'
+            f'  end repeat\n'
+            f'  if not navOk then return "ABORT_NAV@@header_timeout"\n'
+            f'  delay 0.03\n'
+        )
+
+    script = (
+        f'set jsHeader to "{header_esc}"\n'
+        f'set jsFind to "{find_esc}"\n'
+        f'set jsMenu to "{menu_esc}"\n'
+        f'set jsReply to "{reply_esc}"\n'
+        f'set jsMode to "{mode_esc}"\n'
+        f'set jsType to "{type_esc}"\n'
+        f'set jsEnter to "{enter_esc}"\n'
+        f'set jsState to "{state_esc}"\n'
+        f'{nav_setup}'
+        f'tell application "Google Chrome"\n'
+        f'  set targetTab to missing value\n'
+        f'  repeat with w in windows\n'
+        f'    if (id of w as integer) is {win_id} then\n'
+        f'      repeat with t in tabs of w\n'
+        f'        if (id of t as integer) is {tab_id} then\n'
+        f'          set targetTab to t\n'
+        f'          exit repeat\n'
+        f'        end if\n'
+        f'      end repeat\n'
+        f'    end if\n'
+        f'    if targetTab is not missing value then exit repeat\n'
+        f'  end repeat\n'
+        f'  if targetTab is missing value then return "ABORT_NO_TAB"\n'
+        f'{nav_block}'
+        f'  set findJson to execute targetTab javascript jsFind\n'
+        f'  if findJson does not contain "\\"ok\\":true" then return "ABORT_FIND@@" & findJson\n'
+        f'  set menuReady to false\n'
+        f'  repeat 24 times\n'
+        f'    delay 0.03\n'
+        f'    if (execute targetTab javascript jsMenu) contains "\\"present\\":true" then\n'
+        f'      set menuReady to true\n'
+        f'      exit repeat\n'
+        f'    end if\n'
+        f'  end repeat\n'
+        f'  if not menuReady then return "ABORT_REPLY@@{{\\"reason\\":\\"context_menu_did_not_appear\\"}}"\n'
+        f'  set replyJson to execute targetTab javascript jsReply\n'
+        f'  if replyJson does not contain "\\"ok\\":true" then return "ABORT_REPLY@@" & replyJson\n'
+        f'  set modeOk to false\n'
+        f'  set modeJson to ""\n'
+        f'  repeat 25 times\n'
+        f'    delay 0.04\n'
+        f'    set modeJson to execute targetTab javascript jsMode\n'
+        f'    if modeJson contains "\\"bannerPresent\\":true" then\n'
+        f'      set modeOk to true\n'
+        f'      exit repeat\n'
+        f'    end if\n'
+        f'  end repeat\n'
+        f'  if not modeOk then return "ABORT_MODE@@" & modeJson\n'
+        f'  set typeJson to execute targetTab javascript jsType\n'
+        f'  delay 0.03\n'
+        f'  set enterJson to execute targetTab javascript jsEnter\n'
+        f'  set finalJson to ""\n'
+        f'  set sentOk to false\n'
+        f'  repeat 25 times\n'
+        f'    delay 0.04\n'
+        f'    set finalJson to execute targetTab javascript jsState\n'
+        f'    if finalJson contains "\\"replySent\\":true" then\n'
+        f'      set sentOk to true\n'
+        f'      exit repeat\n'
+        f'    end if\n'
+        f'  end repeat\n'
+        f'  return findJson & "@@F@@" & replyJson & "@@R@@" & typeJson & "@@T@@" & enterJson & "@@E@@" & finalJson\n'
+        f'end tell'
+    )
+    try:
+        raw = _osascript(script, timeout=20)
+    except SkillError as e:
+        return {"ok": False, "stage": "osascript", "reason": str(e)}
+    if raw == "ABORT_NO_TAB":
+        return {"ok": False, "stage": "locate_tab", "reason": "extension tab not found"}
+    if raw.startswith("ABORT_NAV@@"):
+        return {"ok": False, "stage": "navigate", "reason": raw[len("ABORT_NAV@@"):],
+                "room": nav_room}
+    if raw.startswith("ABORT_FIND@@"):
+        return {"ok": False, "stage": "find_message", "reason": "target message not found",
+                "detail": raw[len("ABORT_FIND@@"):], "target": target}
+    if raw.startswith("ABORT_REPLY@@"):
+        return {"ok": False, "stage": "click_reply", "reason": "Reply menu item not found",
+                "detail": raw[len("ABORT_REPLY@@"):]}
+    if raw.startswith("ABORT_MODE@@"):
+        return {"ok": False, "stage": "reply_mode", "reason": "reply quote banner did not appear",
+                "detail": raw[len("ABORT_MODE@@"):]}
+    if "@@F@@" not in raw:
+        return {"ok": False, "stage": "unknown", "raw": raw[:300]}
+    find_part, rest = raw.split("@@F@@", 1)
+    reply_part, rest = rest.split("@@R@@", 1)
+    type_part, rest = rest.split("@@T@@", 1)
+    enter_part, final_part = rest.split("@@E@@", 1)
+
+    def _j(s):
+        try:
+            return json.loads(s)
+        except Exception:
+            return {}
+
+    find_info, final_info = _j(find_part), _j(final_part)
+    if not _j(type_part).get("ok"):
+        return {"ok": False, "stage": "type", "detail": _j(type_part)}
+    if final_info.get("replySent"):
+        return {"ok": True, "matched": find_info.get("matched"), "text": text,
+                "verified_by": "reply_bubble"}
+    return {"ok": False, "stage": "not_confirmed", "detail": final_info,
+            "matched": find_info.get("matched")}
+
+
+def cmd_reply(args, sel, sources):
+    """Reply to a specific message in a room. --to is a substring of the message being
+    replied to; --text is the reply body. Hot path skips navigation when already in the room."""
+    if not args.room or not args.to or not args.text:
+        raise SkillError("--room, --to and --text are required")
+    loc = _require_tab()
+    t0 = time.time()
+
+    hdr_sel = json.dumps(sel.get("chat_room_header"), ensure_ascii=False)
+    try:
+        header = exec_js(f"return (document.querySelector({hdr_sel})||{{}}).textContent||'';",
+                         loc, timeout=5).strip()
+    except Exception:
+        header = ""
+    on_room = bool(header) and (header == args.room or args.room in header or header in args.room)
+
+    if on_room:
+        # HOT: already in the room — reply directly, no navigation.
+        result = _do_reply(sel, loc, args.to, args.text)
+        result["path"] = "hot"
+    else:
+        # COLD: fold navigation into the same osascript as the reply.
+        result = _do_reply(sel, loc, args.to, args.text,
+                           nav_room=args.room, nav_query=args.room)
+        result["path"] = "cold"
+        if result.get("ok"):
+            try:
+                exec_js(js_set_search(sel, ""), loc, timeout=5)
+            except Exception:
+                pass
+    result["room"] = args.room
+    result["duration_ms"] = int((time.time() - t0) * 1000)
+    return result
+
+
+# ── send-sticker ─────────────────────────────────────────────────────────────
+
+def _do_send_sticker(sel: dict, loc: dict, package_idx: int, sticker_idx: int) -> dict:
+    """Open the sticker picker, click the target sticker (sends immediately), and
+    verify a sticker bubble appeared. Assumes the target room is already open.
+
+    The sticker picker is opened by the editor's 'Select sticker' button. Opening it
+    requires a *trusted* user-activation gesture; a JS-injected `.click()` does not
+    grant user activation, so the picker may not open under the AppleScript bridge.
+    When that happens this returns reason='picker_unavailable' rather than failing
+    opaquely — see README for the environment requirement."""
+    win_id = loc.get("window_id")
+    tab_id = loc.get("tab_id")
+
+    def esc(js):
+        return js.replace("\\", "\\\\").replace('"', '\\"')
+
+    js_count = (
+        "(function(){var m=document.querySelectorAll('[class*=\"messageLayout-module__message__\"]');"
+        "var n=0;for(var i=0;i<m.length;i++){if(m[i].querySelector('[class*=\"stickerMessageContent-module__\"]'))n++;}"
+        "return JSON.stringify({stickerBubbles:n});})()"
+    )
+    js_open = (
+        "(function(){var ed=document.querySelector('[class*=\"chatroomEditor-module\"]');"
+        "if(!ed)return JSON.stringify({ok:false,reason:'no_editor'});"
+        "var bs=ed.querySelectorAll('button');var b=null;"
+        "for(var i=0;i<bs.length;i++){if(bs[i].getAttribute('aria-label')==='Select sticker')b=bs[i];}"
+        "if(!b)return JSON.stringify({ok:false,reason:'no_sticker_button'});"
+        "b.click();return JSON.stringify({ok:true});})()"
+    )
+    js_picker = (
+        "(function(){return JSON.stringify({present:"
+        "!!document.querySelector('[class*=\"stickerPopup-module__popup__\"]')});})()"
+    )
+    js_click = (
+        "(function(){"
+        f"var PKG={int(package_idx)},STK={int(sticker_idx)};"
+        "var pop=document.querySelector('[class*=\"stickerPopup-module__popup__\"]');"
+        "if(!pop)return JSON.stringify({ok:false,reason:'no_popup'});"
+        "var pkgs=pop.querySelectorAll('[class*=\"packageItemList-module__package_item_list__\"]');"
+        "if(!pkgs.length)return JSON.stringify({ok:false,reason:'no_packages'});"
+        "if(PKG>=pkgs.length)return JSON.stringify({ok:false,reason:'package_out_of_range',packages:pkgs.length});"
+        "var stks=pkgs[PKG].querySelectorAll('button[class*=\"packageItemList-module__button_item__\"]');"
+        "if(!stks.length)return JSON.stringify({ok:false,reason:'empty_package'});"
+        "if(STK>=stks.length)return JSON.stringify({ok:false,reason:'sticker_out_of_range',stickers:stks.length});"
+        "stks[STK].click();return JSON.stringify({ok:true});})()"
+    )
+
+    script = (
+        f'set jsCount to "{esc(js_count)}"\n'
+        f'set jsOpen to "{esc(js_open)}"\n'
+        f'set jsPicker to "{esc(js_picker)}"\n'
+        f'set jsClick to "{esc(js_click)}"\n'
+        f'tell application "Google Chrome"\n'
+        f'  set targetTab to missing value\n'
+        f'  repeat with w in windows\n'
+        f'    if (id of w as integer) is {win_id} then\n'
+        f'      repeat with t in tabs of w\n'
+        f'        if (id of t as integer) is {tab_id} then\n'
+        f'          set targetTab to t\n'
+        f'          exit repeat\n'
+        f'        end if\n'
+        f'      end repeat\n'
+        f'    end if\n'
+        f'    if targetTab is not missing value then exit repeat\n'
+        f'  end repeat\n'
+        f'  if targetTab is missing value then return "ABORT_NO_TAB"\n'
+        f'  set countBefore to execute targetTab javascript jsCount\n'
+        f'  set openJson to execute targetTab javascript jsOpen\n'
+        f'  if openJson does not contain "\\"ok\\":true" then return "ABORT_OPEN@@" & openJson\n'
+        f'  set pickerReady to false\n'
+        f'  repeat 16 times\n'
+        f'    delay 0.1\n'
+        f'    if (execute targetTab javascript jsPicker) contains "\\"present\\":true" then\n'
+        f'      set pickerReady to true\n'
+        f'      exit repeat\n'
+        f'    end if\n'
+        f'  end repeat\n'
+        f'  if not pickerReady then return "ABORT_PICKER@@" & openJson\n'
+        f'  delay 0.2\n'
+        f'  set clickJson to execute targetTab javascript jsClick\n'
+        f'  if clickJson does not contain "\\"ok\\":true" then return "ABORT_STICKER@@" & clickJson\n'
+        f'  set countAfter to ""\n'
+        f'  set sentOk to false\n'
+        f'  repeat 20 times\n'
+        f'    delay 0.05\n'
+        f'    set countAfter to execute targetTab javascript jsCount\n'
+        f'    set sentOk to true\n'
+        f'    exit repeat\n'
+        f'  end repeat\n'
+        f'  delay 0.3\n'
+        f'  set countAfter to execute targetTab javascript jsCount\n'
+        f'  return countBefore & "@@C@@" & clickJson & "@@K@@" & countAfter\n'
+        f'end tell'
+    )
+    try:
+        raw = _osascript(script, timeout=20)
+    except SkillError as e:
+        return {"ok": False, "stage": "osascript", "reason": str(e)}
+    if raw == "ABORT_NO_TAB":
+        return {"ok": False, "stage": "locate_tab", "reason": "extension tab not found"}
+    if raw.startswith("ABORT_OPEN@@"):
+        return {"ok": False, "stage": "open_picker", "reason": "sticker button not found",
+                "detail": raw[len("ABORT_OPEN@@"):]}
+    if raw.startswith("ABORT_PICKER@@"):
+        return {"ok": False, "stage": "open_picker", "reason": "picker_unavailable",
+                "detail": ("The sticker picker did not open. Opening it needs a trusted "
+                           "user-activation gesture, which the AppleScript execute-javascript "
+                           "bridge cannot produce. See README (send-sticker).")}
+    if raw.startswith("ABORT_STICKER@@"):
+        try:
+            detail = json.loads(raw[len("ABORT_STICKER@@"):])
+        except Exception:
+            detail = {}
+        return {"ok": False, "stage": "select_sticker",
+                "reason": detail.get("reason", "sticker_not_selected"), "detail": detail}
+    if "@@C@@" not in raw:
+        return {"ok": False, "stage": "unknown", "raw": raw[:300]}
+    before_part, rest = raw.split("@@C@@", 1)
+    click_part, after_part = rest.split("@@K@@", 1)
+
+    def _j(s):
+        try:
+            return json.loads(s)
+        except Exception:
+            return {}
+
+    before_n = _j(before_part).get("stickerBubbles", 0)
+    after_n = _j(after_part).get("stickerBubbles", 0)
+    if after_n > before_n:
+        return {"ok": True, "verified_by": "sticker_bubble",
+                "package": package_idx, "sticker": sticker_idx}
+    return {"ok": False, "stage": "not_confirmed",
+            "reason": "no new sticker bubble appeared",
+            "sticker_bubbles": [before_n, after_n]}
+
+
+def cmd_send_sticker(args, sel, sources):
+    """Send a sticker to a room. --package / --sticker pick which sticker by position
+    (defaults to the first sticker of the first package). Hot path skips navigation."""
+    if not args.to:
+        raise SkillError("--to is required")
+    loc = _require_tab()
+    t0 = time.time()
+
+    hdr_sel = json.dumps(sel.get("chat_room_header"), ensure_ascii=False)
+    try:
+        header = exec_js(f"return (document.querySelector({hdr_sel})||{{}}).textContent||'';",
+                         loc, timeout=5).strip()
+    except Exception:
+        header = ""
+    on_room = bool(header) and (header == args.to or args.to in header or header in args.to)
+    path = "hot"
+    if not on_room:
+        path = "cold"
+        nav = _navigate_to_room(sel, loc, args.to)
+        if not nav.get("ok"):
+            return {"ok": False, "stage": "navigate", "reason": nav,
+                    "duration_ms": int((time.time() - t0) * 1000)}
+
+    result = _do_send_sticker(sel, loc, args.package, args.sticker)
+    result["room"] = args.to
+    result["path"] = path
+    result["duration_ms"] = int((time.time() - t0) * 1000)
+    return result
+
+
 def cmd_history(args, sel, sources):
     if not args.room:
         raise SkillError("--room is required")
@@ -1643,6 +2106,19 @@ def main():
     lg.add_argument("--confirm", action="store_true",
                     help="Required. Leaving a group is irreversible.")
 
+    rp = sub.add_parser("reply")
+    rp.add_argument("--room", required=True)
+    rp.add_argument("--to", required=True,
+                    help="Substring of the message being replied to.")
+    rp.add_argument("--text", required=True, help="The reply body.")
+
+    ss = sub.add_parser("send-sticker")
+    ss.add_argument("--to", required=True, help="Room to send the sticker to.")
+    ss.add_argument("--package", type=int, default=0,
+                    help="Sticker package index (default 0).")
+    ss.add_argument("--sticker", type=int, default=0,
+                    help="Sticker index within the package (default 0).")
+
     h = sub.add_parser("history")
     h.add_argument("--room", required=True)
     h.add_argument("--limit", type=int, default=30)
@@ -1673,7 +2149,8 @@ def main():
         "enable-applescript": cmd_enable_applescript,
         "list-rooms": cmd_list_rooms, "list-contacts": cmd_list_contacts,
         "send": cmd_send, "history": cmd_history, "search": cmd_search,
-        "leave-group": cmd_leave_group,
+        "leave-group": cmd_leave_group, "reply": cmd_reply,
+        "send-sticker": cmd_send_sticker,
         "watch": cmd_watch,
         "selectors": cmd_selectors,
         "cache-info": cmd_cache_info, "cache-dump": cmd_cache_dump,

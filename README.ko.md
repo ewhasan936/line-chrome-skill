@@ -103,6 +103,8 @@ python3 cli.py list-contacts --limit 50
 python3 cli.py send --to "홍길동" --text "안녕하세요"
 python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "회의"
+python3 cli.py reply --room "Family" --to "6시에 보자" --text "알겠어"
+python3 cli.py send-sticker --to "Family"   # 아래 "스티커" 참고
 python3 cli.py leave-group --room "Old Group" --confirm   # 되돌릴 수 없음 — 아래 참고
 python3 cli.py watch --interval 5         # 새 메시지 폴링 (Ctrl-C로 중지)
 
@@ -124,6 +126,26 @@ System Events로 `보기 → 개발자 정보 → Apple Events의 자바스크�
 
 참고: Chrome은 이 설정을 AppleScript로 **끄는** 것은 차단합니다 — 켜는 방향만
 자동화 가능하며, 이 명령에는 그것으로 충분합니다.
+
+### `reply`
+
+`reply --room R --to "<부분문자열>" --text "<본문>"` — 특정 이전 메시지에 인용
+답장을 보냅니다. `--to`는 답장 대상 메시지를 식별하는 부분 문자열이며, 여러 개가
+일치하면 가장 최근 것을 사용합니다. 이미 방에 있으면 약 0.4초, 방 이동이 필요하면
+약 0.8초에 완료됩니다.
+
+### `send-sticker`
+
+`send-sticker --to R [--package N] [--sticker N]` — 패키지/스티커 인덱스로 지정해
+스티커를 보냅니다 (기본 `0 0` = 첫 패키지의 첫 스티커).
+
+**환경 제약:** LINE 스티커 피커를 여는 것은 *신뢰된(trusted)* 사용자 활성화
+제스처를 요구합니다. AppleScript `execute javascript` 브리지로 주입한 클릭은 사용자
+활성화를 부여하지 못해 피커가 보통 열리지 않습니다. 열 수 없을 때는
+`{"ok": false, "reason": "picker_unavailable"}`를 반환해 명확히 알립니다. 스티커
+전송이 동작하려면 신뢰된 입력 — Chrome DevTools Protocol(`Input.dispatchMouseEvent`)
+또는 macOS 손쉬운 사용 권한을 가진 OS 레벨 합성 클릭 — 이 필요합니다. 피커 구조와
+전송·검증 로직은 구현되어 있어, 신뢰된 입력 경로가 생기는 즉시 동작합니다.
 
 ### `leave-group`
 

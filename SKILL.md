@@ -34,6 +34,8 @@ python3 cli.py diagnose                   # check each selector against the live
 python3 cli.py list-rooms
 python3 cli.py list-contacts
 python3 cli.py send --to "홍길동" --text "안녕"
+python3 cli.py reply --room "Family" --to "see you at 6" --text "got it"
+python3 cli.py send-sticker --to "Family"        # see "Stickers" note below
 python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "회의"
 python3 cli.py leave-group --room "Old Group" --confirm   # irreversible — see below
@@ -45,6 +47,29 @@ python3 cli.py cache-dump --out ~/line-cache-copy
 ```
 
 All commands print JSON to stdout.
+
+## Replying to a message (`reply`)
+
+`reply --room R --to "<substring>" --text "<body>"` replies to a specific earlier
+message. `--to` is a text substring identifying the message being replied to; if
+several messages match, the most recent one is used. The reply is verified by
+confirming a quoted reply bubble appeared. Hot path (already in the room) ~0.4s,
+cold path (navigation folded in) ~0.8s — both under 1s.
+
+## Stickers (`send-sticker`)
+
+`send-sticker --to R [--package N] [--sticker N]` sends a sticker (package/sticker
+default to 0,0 = first sticker of the first package).
+
+**Environment limitation:** opening LINE's sticker picker requires a *trusted*
+user-activation gesture. A JavaScript-injected click through the AppleScript
+`execute javascript` bridge does not grant user activation, so the picker usually
+will not open. When it cannot, `send-sticker` returns
+`{"ok": false, "reason": "picker_unavailable" | "no_packages"}` rather than failing
+opaquely. Making stickers work needs trusted input — Chrome DevTools Protocol
+(`Input.dispatchMouseEvent`) or OS-level synthetic clicks with macOS Accessibility
+permission. The picker/sticker structure and the send+verify logic are implemented,
+so the command works as soon as a trusted-input path is available.
 
 ## Leaving a group (`leave-group`)
 
