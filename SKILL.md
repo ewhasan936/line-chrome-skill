@@ -61,15 +61,15 @@ cold path (navigation folded in) ~0.8s — both under 1s.
 `send-sticker --to R [--package N] [--sticker N]` sends a sticker (package/sticker
 default to 0,0 = first sticker of the first package).
 
-**Environment limitation:** opening LINE's sticker picker requires a *trusted*
-user-activation gesture. A JavaScript-injected click through the AppleScript
-`execute javascript` bridge does not grant user activation, so the picker usually
-will not open. When it cannot, `send-sticker` returns
-`{"ok": false, "reason": "picker_unavailable" | "no_packages"}` rather than failing
-opaquely. Making stickers work needs trusted input — Chrome DevTools Protocol
-(`Input.dispatchMouseEvent`) or OS-level synthetic clicks with macOS Accessibility
-permission. The picker/sticker structure and the send+verify logic are implemented,
-so the command works as soon as a trusted-input path is available.
+Opening LINE's sticker picker requires a *trusted* user-activation gesture, so
+`send-sticker` uses macOS CoreGraphics session-event clicks inside Chrome.
+Grant Accessibility permission to the terminal or app running the CLI. If trusted
+input is unavailable, the command returns
+`{"ok": false, "reason": "trusted_input_unavailable"}`.
+
+Successful sends are verified by detecting a new sticker message bubble. Negative
+indexes fail before LINE is touched; out-of-range package/sticker indexes fail
+cleanly with `ok: false`.
 
 ## Leaving a group (`leave-group`)
 

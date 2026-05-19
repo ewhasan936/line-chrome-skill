@@ -119,6 +119,17 @@ python3 cli.py cache-dump --out ~/line-cache-copy
 
 すべてのコマンドは JSON を stdout に出力します。
 
+## テスト
+
+```sh
+python3 -m unittest tests/test_send_sticker_contract.py
+LINE_TEST_ONLY=sticker LINE_TEST_ROOM="나만의 그룹" python3 tests/test_reply_sticker.py
+```
+
+最初のコマンドは Chrome や LINE に触れずに `send-sticker` の JSON/検証契約を
+確認します。2 つ目は設定したテストルームだけでステッカーのライブマトリクスを実行し、
+hot/cold 経路が 1 秒未満で終わることも確認します。
+
 ### `enable-applescript`
 
 AppleScript JS 実行がオンかどうかを調べます。オフの場合、Chrome を前面に出し、System
@@ -141,15 +152,15 @@ Events 経由で `表示 → デベロッパー → Apple Events からの JavaS
 `send-sticker --to R [--package N] [--sticker N]` — パッケージ/ステッカーのインデックス
 で指定してステッカーを送ります（既定は `0 0` = 最初のパッケージの最初のステッカー）。
 
-**環境上の制約:** LINE のステッカーピッカーを開くには *信頼された (trusted)*
-ユーザーアクティベーションのジェスチャーが必要です。AppleScript の
-`execute javascript` ブリッジで注入したクリックはユーザーアクティベーションを
-付与しないため、ピッカーは通常開きません。開けない場合は
-`{"ok": false, "reason": "picker_unavailable"}` を返して明示します。ステッカー送信を
-動作させるには信頼された入力 — Chrome DevTools Protocol（`Input.dispatchMouseEvent`）
-または macOS アクセシビリティ権限を持つ OS レベルの合成クリック — が必要です。
-ピッカー構造と送信・検証ロジックは実装済みで、信頼された入力経路が用意され次第
-動作します。
+LINE のステッカーピッカーを開くには *信頼された (trusted)* ユーザー
+アクティベーションのジェスチャーが必要なため、`send-sticker` は macOS CoreGraphics
+のセッションイベントで Chrome 内を OS レベルクリックします。CLI を実行するターミナルまたは
+アプリにアクセシビリティ権限を付与してください。信頼された入力を使用できない場合は
+`{"ok": false, "reason": "trusted_input_unavailable"}` を返します。
+
+送信成功は新しいステッカーメッセージのバブルを検出して検証します。負のインデックスは
+LINE に触れる前に拒否し、範囲外のパッケージ/ステッカーインデックスは `ok: false`
+の JSON で明確に失敗します。
 
 ### `leave-group`
 

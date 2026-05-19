@@ -7,6 +7,8 @@ Selector mapping is externalized for resilience to UI changes. Override priority
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import os
 import shutil
@@ -84,6 +86,8 @@ def _osascript(applescript: str, timeout: int = 30) -> str:
         )
     except FileNotFoundError:
         raise SkillError("osascript not found — this skill is macOS-only")
+    except subprocess.TimeoutExpired:
+        raise SkillError(f"osascript timed out after {timeout}s")
     if out.returncode != 0:
         raise SkillError(f"osascript failed: {out.stderr.strip()}")
     return out.stdout.strip()
@@ -102,10 +106,19 @@ on run
       repeat with t in tabs of w
         set u to URL of t
         if u starts with "{EXTENSION_PREFIX}" then
+          set candidate to (id of w as string) & "|" & (id of t as string) & "|" & u
           if u contains "/index.html" then
-            return (id of w as string) & "|" & (id of t as string) & "|" & u
+            -- Prefer the real detached LINE app window. Directly opening the extension
+            -- URL can leave a Chrome error document whose URL still looks correct.
+            set ttl to title of t
+            if ttl is "LINE" then return candidate
+            if fallback is "" then
+              set fallback to candidate
+            else if u contains "#/chats/" and fallback does not contain "#/chats/" then
+              set fallback to candidate
+            end if
           else if fallback is "" then
-            set fallback to (id of w as string) & "|" & (id of t as string) & "|" & u
+            set fallback to candidate
           end if
         end if
       end repeat
@@ -127,7 +140,8 @@ def chrome_running() -> bool:
     return raw.lower() == "true"
 
 
-def exec_js(js: str, tab_loc: dict, timeout: int = 30) -> str:
+def exec_js(js: str, tab_loc: dict, timeout: int = 30,
+            fallback: bool = True, focus: bool = False) -> str:
     """Execute JS in the located LINE extension tab. Looks up by stable window/tab id so
     background popups opening/closing between calls don't shift our target."""
     win_id = tab_loc.get("window_id")
@@ -143,34 +157,62 @@ def exec_js(js: str, tab_loc: dict, timeout: int = 30) -> str:
         "catch(e){return JSON.stringify({error:String(e&&e.message||e)});}})()"
     )
     js_escaped = wrapped.replace("\\", "\\\\").replace('"', '\\"')
-    # Locate the tab by id at execution time (handles windows/tabs that have shifted)
+    # Locate the tab by id at execution time (handles windows/tabs that have shifted).
+    # Popup windows are short-lived; callers can disable fallback so a stale popup id
+    # never silently executes against the main LINE tab.
+    fallback_block = ""
+    if fallback:
+        fallback_block = (
+            f'  if targetTab is missing value then\n'
+            f'    -- fallback: any tab matching the LINE extension URL prefix\n'
+            f'    repeat with w in windows\n'
+            f'      set tabIndex to 1\n'
+            f'      repeat with t in tabs of w\n'
+            f'        if URL of t starts with "{EXTENSION_PREFIX}" and URL of t contains "/index.html" then\n'
+            f'          set targetTab to t\n'
+            f'          set targetWindow to w\n'
+            f'          set targetTabIndex to tabIndex\n'
+            f'          exit repeat\n'
+            f'        end if\n'
+            f'        set tabIndex to tabIndex + 1\n'
+            f'      end repeat\n'
+            f'      if targetTab is not missing value then exit repeat\n'
+            f'    end repeat\n'
+            f'  end if\n'
+        )
+    focus_block = ""
+    if focus:
+        focus_block = (
+            f'  if targetWindow is not missing value then\n'
+            f'    if targetTabIndex is not 0 then set active tab index of targetWindow to targetTabIndex\n'
+            f'    set visible of targetWindow to true\n'
+            f'    set index of targetWindow to 1\n'
+            f'    activate\n'
+            f'  end if\n'
+        )
     script = (
         f'tell application "Google Chrome"\n'
         f'  set targetTab to missing value\n'
+        f'  set targetWindow to missing value\n'
+        f'  set targetTabIndex to 0\n'
         f'  repeat with w in windows\n'
-        f'    if (id of w) is {win_id} then\n'
+        f'    if (id of w as integer) is {win_id} then\n'
+        f'      set tabIndex to 1\n'
         f'      repeat with t in tabs of w\n'
-        f'        if (id of t) is {tab_id} then\n'
+        f'        if (id of t as integer) is {tab_id} then\n'
         f'          set targetTab to t\n'
+        f'          set targetWindow to w\n'
+        f'          set targetTabIndex to tabIndex\n'
         f'          exit repeat\n'
         f'        end if\n'
+        f'        set tabIndex to tabIndex + 1\n'
         f'      end repeat\n'
         f'    end if\n'
         f'    if targetTab is not missing value then exit repeat\n'
         f'  end repeat\n'
-        f'  if targetTab is missing value then\n'
-        f'    -- fallback: any tab matching the LINE extension URL prefix\n'
-        f'    repeat with w in windows\n'
-        f'      repeat with t in tabs of w\n'
-        f'        if URL of t starts with "{EXTENSION_PREFIX}" and URL of t contains "/index.html" then\n'
-        f'          set targetTab to t\n'
-        f'          exit repeat\n'
-        f'        end if\n'
-        f'      end repeat\n'
-        f'      if targetTab is not missing value then exit repeat\n'
-        f'    end repeat\n'
-        f'  end if\n'
+        f'{fallback_block}'
         f'  if targetTab is missing value then return ""\n'
+        f'{focus_block}'
         f'  return execute targetTab javascript "{js_escaped}"\n'
         f'end tell'
     )
@@ -425,6 +467,61 @@ def _navigate_to_room(sel: dict, loc: dict, room_name: str) -> dict:
         return {"ok": True, "matched": click_result.get("matched"),
                 "header": state_result.get("header", ""), "query": q}
     return last_result
+
+
+def _open_visible_room_fast(sel: dict, loc: dict, room_name: str) -> dict:
+    """Fast cold path for rooms already visible in the chat list.
+
+    Avoids search input churn; used before the deeper search-based navigator.
+    """
+    win_id = loc.get("window_id")
+    tab_id = loc.get("tab_id")
+    click_js = js_click_room_in_list(sel, room_name)
+
+    def wrap(js: str) -> str:
+        wrapped = (
+            "(function(){try{var r=(function(){"
+            + js
+            + "})();return (typeof r==='string')?r:JSON.stringify(r);}"
+            "catch(e){return JSON.stringify({error:String(e&&e.message||e)});}})()"
+        )
+        return wrapped.replace("\\", "\\\\").replace('"', '\\"')
+
+    script = (
+        f'set jsClick to "{wrap(click_js)}"\n'
+        f'tell application "Google Chrome"\n'
+        f'  set targetTab to missing value\n'
+        f'  repeat with w in windows\n'
+        f'    if (id of w as integer) is {win_id} then\n'
+        f'      repeat with t in tabs of w\n'
+        f'        if (id of t as integer) is {tab_id} then\n'
+        f'          set targetTab to t\n'
+        f'          exit repeat\n'
+        f'        end if\n'
+        f'      end repeat\n'
+        f'    end if\n'
+        f'    if targetTab is not missing value then exit repeat\n'
+        f'  end repeat\n'
+        f'  if targetTab is missing value then return "{{\\"ok\\":false,\\"step\\":\\"no_tab\\"}}@@@"\n'
+        f'  set clickResult to execute targetTab javascript jsClick\n'
+        f'  if clickResult does not contain "\\"ok\\":true" then return clickResult & "@@@"\n'
+        f'  return clickResult & "@@@"\n'
+        f'end tell'
+    )
+    try:
+        raw = _osascript(script, timeout=5)
+    except SkillError as e:
+        return {"ok": False, "step": "osascript", "error": str(e)}
+    if "@@@" not in raw:
+        return {"ok": False, "step": "bad_response", "raw": raw[:200]}
+    click_raw, header = raw.split("@@@", 1)
+    try:
+        click_result = json.loads(click_raw)
+    except json.JSONDecodeError:
+        click_result = {"ok": False, "raw": click_raw}
+    if not click_result.get("ok"):
+        return click_result
+    return {"ok": True, "matched": click_result.get("matched"), "header": header}
 
 
 def js_type_and_send(selectors: dict, text: str) -> str:
@@ -1788,15 +1885,260 @@ def cmd_reply(args, sel, sources):
 
 # ── send-sticker ─────────────────────────────────────────────────────────────
 
-def _do_send_sticker(sel: dict, loc: dict, package_idx: int, sticker_idx: int) -> dict:
+def _parse_pipe_point(raw: str) -> tuple[bool, dict]:
+    """Parse the small pipe protocol returned by sticker coordinate JS.
+
+    Shape:
+      OK|x|y
+      ERR|reason|detail
+
+    Kept intentionally tiny so AppleScript can split it without needing JSON
+    parsing before it performs a trusted OS click.
+    """
+    parts = (raw or "").split("|", 2)
+    if len(parts) >= 3 and parts[0] == "OK":
+        try:
+            return True, {"x": int(float(parts[1])), "y": int(float(parts[2]))}
+        except ValueError:
+            return False, {"reason": "bad_coordinates", "raw": raw}
+    if len(parts) >= 2 and parts[0] == "ERR":
+        return False, {"reason": parts[1], "detail": parts[2] if len(parts) > 2 else ""}
+    return False, {"reason": "bad_point_response", "raw": raw}
+
+
+def _parse_sticker_count(raw: str) -> int:
+    try:
+        return int(json.loads(raw).get("stickerBubbles", 0))
+    except Exception:
+        return 0
+
+
+def _focus_chrome_tab(loc: dict) -> None:
+    """Bring the target Chrome window/tab to the front using Chrome AppleScript only."""
+    win_id = loc.get("window_id")
+    tab_id = loc.get("tab_id")
+    if win_id is None or tab_id is None:
+        return
+    script = (
+        f'tell application "Google Chrome"\n'
+        f'  repeat with w in windows\n'
+        f'    if (id of w as integer) is {int(win_id)} then\n'
+        f'      set tabIndex to 1\n'
+        f'      repeat with t in tabs of w\n'
+        f'        if (id of t as integer) is {int(tab_id)} then\n'
+        f'          set active tab index of w to tabIndex\n'
+        f'          exit repeat\n'
+        f'        end if\n'
+        f'        set tabIndex to tabIndex + 1\n'
+        f'      end repeat\n'
+        f'      set visible of w to true\n'
+        f'      set index of w to 1\n'
+        f'      activate\n'
+        f'      return "ok"\n'
+        f'    end if\n'
+        f'  end repeat\n'
+        f'end tell'
+    )
+    _osascript(script, timeout=3)
+
+
+def _find_sticker_popup_tab(timeout: float = 0.7) -> dict:
+    """Locate LINE's transient sticker popup tab exactly (no fallback)."""
+    deadline = time.time() + timeout
+    script = (
+        f'tell application "Google Chrome"\n'
+        f'  repeat with w in windows\n'
+        f'    repeat with t in tabs of w\n'
+        f'      try\n'
+        f'        set u to URL of t\n'
+        f'        if u is "{EXTENSION_PREFIX}popup.html" then\n'
+        f'          return (id of w as string) & "|" & (id of t as string) & "|" & u\n'
+        f'        end if\n'
+        f'      end try\n'
+        f'    end repeat\n'
+        f'  end repeat\n'
+        f'  return ""\n'
+        f'end tell'
+    )
+    while True:
+        raw = _osascript(script, timeout=3)
+        if raw:
+            win, tab, url = raw.split("|", 2)
+            return {"window_id": int(win), "tab_id": int(tab), "url": url}
+        if time.time() >= deadline:
+            return {}
+        time.sleep(0.04)
+
+
+def _exec_sticker_popup_js(js: str, timeout: float = 0.6) -> str:
+    """Find LINE's transient sticker popup and execute JS in one AppleScript call."""
+    wrapped = (
+        "(function(){try{var r=(function(){"
+        + js
+        + "})();return (typeof r==='string')?r:JSON.stringify(r);}"
+        "catch(e){return JSON.stringify({error:String(e&&e.message||e)});}})()"
+    )
+    js_escaped = wrapped.replace("\\", "\\\\").replace('"', '\\"')
+    loops = max(1, int(timeout / 0.04))
+    script = (
+        f'tell application "Google Chrome"\n'
+        f'  set targetTab to missing value\n'
+        f'  set targetWindow to missing value\n'
+        f'  repeat {loops} times\n'
+        f'    repeat with w in windows\n'
+        f'      repeat with t in tabs of w\n'
+        f'        try\n'
+        f'          if URL of t is "{EXTENSION_PREFIX}popup.html" then\n'
+        f'            set targetTab to t\n'
+        f'            set targetWindow to w\n'
+        f'            exit repeat\n'
+        f'          end if\n'
+        f'        end try\n'
+        f'      end repeat\n'
+        f'      if targetTab is not missing value then exit repeat\n'
+        f'    end repeat\n'
+        f'    if targetTab is not missing value then exit repeat\n'
+        f'    delay 0.04\n'
+        f'  end repeat\n'
+        f'  if targetTab is missing value then return ""\n'
+        f'  if targetWindow is not missing value then\n'
+        f'    set visible of targetWindow to true\n'
+        f'    set index of targetWindow to 1\n'
+        f'    activate\n'
+        f'  end if\n'
+        f'  return execute targetTab javascript "{js_escaped}"\n'
+        f'end tell'
+    )
+    return _osascript(script, timeout=max(3, int(timeout) + 2))
+
+
+class _CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+def _trusted_click(x: int, y: int) -> dict:
+    """Post a real left-click at screen coordinates using CoreGraphics.
+
+    This avoids `tell application "System Events" to click at ...`, which can
+    block indefinitely in some Chrome/Accessibility states.
+    """
+    app_path = ctypes.util.find_library("ApplicationServices")
+    if not app_path:
+        return {"ok": False, "reason": "application_services_not_found"}
+    cf_path = ctypes.util.find_library("CoreFoundation")
+    app = ctypes.CDLL(app_path)
+    cf = ctypes.CDLL(cf_path) if cf_path else None
+
+    app.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+    app.CGEventCreateMouseEvent.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, _CGPoint, ctypes.c_uint32
+    ]
+    app.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+    if cf:
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+    point = _CGPoint(float(x), float(y))
+    # 5 = mouse moved, 1 = left down, 2 = left up, 0 = left button.
+    # kCGSessionEventTap (1) reaches Chrome extension windows in normal user sessions;
+    # kCGHIDEventTap can move the cursor without delivering mouse down/up to Chrome.
+    event_tap = 1
+
+    def post(kind: int) -> bool:
+        event = app.CGEventCreateMouseEvent(None, kind, point, 0)
+        if not event:
+            return False
+        app.CGEventPost(event_tap, event)
+        if cf:
+            cf.CFRelease(event)
+        return True
+
+    if not post(5):
+        return {"ok": False, "reason": "mouse_move_event_failed", "x": x, "y": y}
+    time.sleep(0.015)
+    if not post(1):
+        return {"ok": False, "reason": "mouse_down_event_failed", "x": x, "y": y}
+    time.sleep(0.025)
+    if not post(2):
+        return {"ok": False, "reason": "mouse_up_event_failed", "x": x, "y": y}
+    return {"ok": True, "x": x, "y": y, "tap": "session"}
+
+
+def _json_get(raw: str) -> dict:
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def _parse_send_sticker_result(raw: str, package_idx: int, sticker_idx: int) -> dict:
+    """Map the AppleScript sticker workflow result into the public CLI contract."""
+    if raw == "ABORT_NO_TAB":
+        return {"ok": False, "stage": "locate_tab", "reason": "extension tab not found"}
+    if raw.startswith("ABORT_OPEN@@"):
+        ok, detail = _parse_pipe_point(raw[len("ABORT_OPEN@@"):])
+        return {"ok": False, "stage": "open_picker",
+                "reason": detail.get("reason", "sticker button not found"),
+                "detail": detail}
+    if raw.startswith("ABORT_TRUSTED_CLICK@@"):
+        return {
+            "ok": False,
+            "stage": "trusted_click",
+            "reason": "trusted_input_unavailable",
+            "detail": raw[len("ABORT_TRUSTED_CLICK@@"):],
+            "hint": (
+                "Grant Accessibility permission to the terminal or app running this CLI "
+                "so CoreGraphics can perform a trusted click in Chrome."
+            ),
+        }
+    if raw.startswith("ABORT_PICKER@@"):
+        return {
+            "ok": False,
+            "stage": "open_picker",
+            "reason": "picker_unavailable",
+            "detail": (
+                "The sticker picker did not open after a trusted click. Verify the "
+                "LINE extension window is visible and the editor is enabled."
+            ),
+        }
+    if raw.startswith("ABORT_STICKER@@"):
+        ok, detail = _parse_pipe_point(raw[len("ABORT_STICKER@@"):])
+        return {"ok": False, "stage": "select_sticker",
+                "reason": detail.get("reason", "sticker_not_selected"), "detail": detail}
+    if raw.startswith("ABORT_VERIFY@@"):
+        return {"ok": False, "stage": "not_confirmed",
+                "reason": "no new sticker bubble appeared",
+                "detail": raw[len("ABORT_VERIFY@@"):]}
+    if "@@C@@" not in raw or "@@K@@" not in raw:
+        return {"ok": False, "stage": "unknown", "raw": (raw or "")[:300]}
+
+    before_part, rest = raw.split("@@C@@", 1)
+    click_part, after_part = rest.split("@@K@@", 1)
+    before_n = _parse_sticker_count(before_part)
+    after_n = _parse_sticker_count(after_part)
+    if after_n > before_n:
+        return {
+            "ok": True,
+            "verified_by": "sticker_bubble",
+            "package": package_idx,
+            "sticker": sticker_idx,
+            "trusted_input": "core_graphics",
+            "sticker_bubbles": [before_n, after_n],
+        }
+    return {
+        "ok": False,
+        "stage": "not_confirmed",
+        "reason": "no new sticker bubble appeared",
+        "sticker_bubbles": [before_n, after_n],
+        "click": click_part,
+    }
+
+
+def _do_send_sticker_osascript_legacy(sel: dict, loc: dict, package_idx: int, sticker_idx: int) -> dict:
     """Open the sticker picker, click the target sticker (sends immediately), and
     verify a sticker bubble appeared. Assumes the target room is already open.
 
-    The sticker picker is opened by the editor's 'Select sticker' button. Opening it
-    requires a *trusted* user-activation gesture; a JS-injected `.click()` does not
-    grant user activation, so the picker may not open under the AppleScript bridge.
-    When that happens this returns reason='picker_unavailable' rather than failing
-    opaquely — see README for the environment requirement."""
+    The sticker picker is opened by a trusted OS-level click through System Events.
+    LINE requires user activation here; JS-injected `.click()` is not enough."""
     win_id = loc.get("window_id")
     tab_id = loc.get("tab_id")
 
@@ -1808,37 +2150,46 @@ def _do_send_sticker(sel: dict, loc: dict, package_idx: int, sticker_idx: int) -
         "var n=0;for(var i=0;i<m.length;i++){if(m[i].querySelector('[class*=\"stickerMessageContent-module__\"]'))n++;}"
         "return JSON.stringify({stickerBubbles:n});})()"
     )
-    js_open = (
+    js_open_point = (
         "(function(){var ed=document.querySelector('[class*=\"chatroomEditor-module\"]');"
-        "if(!ed)return JSON.stringify({ok:false,reason:'no_editor'});"
+        "if(!ed)return 'ERR|no_editor|';"
         "var bs=ed.querySelectorAll('button');var b=null;"
-        "for(var i=0;i<bs.length;i++){if(bs[i].getAttribute('aria-label')==='Select sticker')b=bs[i];}"
-        "if(!b)return JSON.stringify({ok:false,reason:'no_sticker_button'});"
-        "b.click();return JSON.stringify({ok:true});})()"
+        "for(var i=0;i<bs.length;i++){var label=((bs[i].getAttribute('aria-label')||'')+' '+(bs[i].getAttribute('title')||'')+' '+(bs[i].textContent||''));"
+        "if(/sticker|스티커|スタンプ|貼圖|贴图/i.test(label)){b=bs[i];break;}}"
+        "if(!b)return 'ERR|no_sticker_button|';"
+        "var r=b.getBoundingClientRect();"
+        "if(!r.width||!r.height)return 'ERR|sticker_button_not_visible|';"
+        "var x=Math.round(window.screenX+(window.outerWidth-window.innerWidth)/2+r.left+r.width/2);"
+        "var y=Math.round(window.screenY+(window.outerHeight-window.innerHeight)+r.top+r.height/2);"
+        "return 'OK|'+x+'|'+y;})()"
     )
     js_picker = (
         "(function(){return JSON.stringify({present:"
         "!!document.querySelector('[class*=\"stickerPopup-module__popup__\"]')});})()"
     )
-    js_click = (
+    js_sticker_point = (
         "(function(){"
         f"var PKG={int(package_idx)},STK={int(sticker_idx)};"
         "var pop=document.querySelector('[class*=\"stickerPopup-module__popup__\"]');"
-        "if(!pop)return JSON.stringify({ok:false,reason:'no_popup'});"
+        "if(!pop)return 'ERR|no_popup|';"
         "var pkgs=pop.querySelectorAll('[class*=\"packageItemList-module__package_item_list__\"]');"
-        "if(!pkgs.length)return JSON.stringify({ok:false,reason:'no_packages'});"
-        "if(PKG>=pkgs.length)return JSON.stringify({ok:false,reason:'package_out_of_range',packages:pkgs.length});"
+        "if(!pkgs.length)return 'ERR|no_packages|';"
+        "if(PKG>=pkgs.length)return 'ERR|package_out_of_range|packages='+pkgs.length;"
         "var stks=pkgs[PKG].querySelectorAll('button[class*=\"packageItemList-module__button_item__\"]');"
-        "if(!stks.length)return JSON.stringify({ok:false,reason:'empty_package'});"
-        "if(STK>=stks.length)return JSON.stringify({ok:false,reason:'sticker_out_of_range',stickers:stks.length});"
-        "stks[STK].click();return JSON.stringify({ok:true});})()"
+        "if(!stks.length)return 'ERR|empty_package|';"
+        "if(STK>=stks.length)return 'ERR|sticker_out_of_range|stickers='+stks.length;"
+        "var b=stks[STK];var r=b.getBoundingClientRect();"
+        "if(!r.width||!r.height)return 'ERR|sticker_not_visible|';"
+        "var x=Math.round(window.screenX+(window.outerWidth-window.innerWidth)/2+r.left+r.width/2);"
+        "var y=Math.round(window.screenY+(window.outerHeight-window.innerHeight)+r.top+r.height/2);"
+        "return 'OK|'+x+'|'+y;})()"
     )
 
     script = (
         f'set jsCount to "{esc(js_count)}"\n'
-        f'set jsOpen to "{esc(js_open)}"\n'
+        f'set jsOpenPoint to "{esc(js_open_point)}"\n'
         f'set jsPicker to "{esc(js_picker)}"\n'
-        f'set jsClick to "{esc(js_click)}"\n'
+        f'set jsStickerPoint to "{esc(js_sticker_point)}"\n'
         f'tell application "Google Chrome"\n'
         f'  set targetTab to missing value\n'
         f'  repeat with w in windows\n'
@@ -1854,73 +2205,234 @@ def _do_send_sticker(sel: dict, loc: dict, package_idx: int, sticker_idx: int) -
         f'  end repeat\n'
         f'  if targetTab is missing value then return "ABORT_NO_TAB"\n'
         f'  set countBefore to execute targetTab javascript jsCount\n'
-        f'  set openJson to execute targetTab javascript jsOpen\n'
-        f'  if openJson does not contain "\\"ok\\":true" then return "ABORT_OPEN@@" & openJson\n'
         f'  set pickerReady to false\n'
-        f'  repeat 16 times\n'
-        f'    delay 0.1\n'
-        f'    if (execute targetTab javascript jsPicker) contains "\\"present\\":true" then\n'
-        f'      set pickerReady to true\n'
+        f'  set openPoint to ""\n'
+        f'  if (execute targetTab javascript jsPicker) contains "\\"present\\":true" then\n'
+        f'    set pickerReady to true\n'
+        f'  else\n'
+        f'    set openPoint to execute targetTab javascript jsOpenPoint\n'
+        f'    if openPoint does not start with "OK|" then return "ABORT_OPEN@@" & openPoint\n'
+        f'    set oldDelims to AppleScript\'s text item delimiters\n'
+        f'    set AppleScript\'s text item delimiters to "|"\n'
+        f'    set openParts to text items of openPoint\n'
+        f'    set AppleScript\'s text item delimiters to oldDelims\n'
+        f'    set openX to item 2 of openParts as integer\n'
+        f'    set openY to item 3 of openParts as integer\n'
+        f'    tell application "Google Chrome" to activate\n'
+        f'    delay 0.03\n'
+        f'    try\n'
+        f'      tell application "System Events" to click at {{openX, openY}}\n'
+        f'    on error errMsg number errNum\n'
+        f'      return "ABORT_TRUSTED_CLICK@@" & errMsg & " (" & errNum & ")"\n'
+        f'    end try\n'
+        f'    repeat 22 times\n'
+        f'      delay 0.03\n'
+        f'      if (execute targetTab javascript jsPicker) contains "\\"present\\":true" then\n'
+        f'        set pickerReady to true\n'
+        f'        exit repeat\n'
+        f'      end if\n'
+        f'    end repeat\n'
+        f'  end if\n'
+        f'  if not pickerReady then return "ABORT_PICKER@@" & openPoint\n'
+        f'  set stickerPoint to ""\n'
+        f'  set stickerReady to false\n'
+        f'  repeat 18 times\n'
+        f'    delay 0.025\n'
+        f'    set stickerPoint to execute targetTab javascript jsStickerPoint\n'
+        f'    if stickerPoint starts with "OK|" then\n'
+        f'      set stickerReady to true\n'
+        f'      exit repeat\n'
+        f'    end if\n'
+        f'    if stickerPoint contains "package_out_of_range" or stickerPoint contains "sticker_out_of_range" or stickerPoint contains "empty_package" then exit repeat\n'
+        f'  end repeat\n'
+        f'  if not stickerReady then return "ABORT_STICKER@@" & stickerPoint\n'
+        f'  set oldDelims to AppleScript\'s text item delimiters\n'
+        f'  set AppleScript\'s text item delimiters to "|"\n'
+        f'  set stickerParts to text items of stickerPoint\n'
+        f'  set AppleScript\'s text item delimiters to oldDelims\n'
+        f'  set stickerX to item 2 of stickerParts as integer\n'
+        f'  set stickerY to item 3 of stickerParts as integer\n'
+        f'  try\n'
+        f'    tell application "System Events" to click at {{stickerX, stickerY}}\n'
+        f'  on error errMsg number errNum\n'
+        f'    return "ABORT_TRUSTED_CLICK@@" & errMsg & " (" & errNum & ")"\n'
+        f'  end try\n'
+        f'  set countAfter to ""\n'
+        f'  set sentOk to false\n'
+        f'  repeat 18 times\n'
+        f'    delay 0.03\n'
+        f'    set countAfter to execute targetTab javascript jsCount\n'
+        f'    if countAfter is not countBefore then\n'
+        f'      set sentOk to true\n'
         f'      exit repeat\n'
         f'    end if\n'
         f'  end repeat\n'
-        f'  if not pickerReady then return "ABORT_PICKER@@" & openJson\n'
-        f'  delay 0.2\n'
-        f'  set clickJson to execute targetTab javascript jsClick\n'
-        f'  if clickJson does not contain "\\"ok\\":true" then return "ABORT_STICKER@@" & clickJson\n'
-        f'  set countAfter to ""\n'
-        f'  set sentOk to false\n'
-        f'  repeat 20 times\n'
-        f'    delay 0.05\n'
-        f'    set countAfter to execute targetTab javascript jsCount\n'
-        f'    set sentOk to true\n'
-        f'    exit repeat\n'
-        f'  end repeat\n'
-        f'  delay 0.3\n'
-        f'  set countAfter to execute targetTab javascript jsCount\n'
-        f'  return countBefore & "@@C@@" & clickJson & "@@K@@" & countAfter\n'
+        f'  if not sentOk then return "ABORT_VERIFY@@" & countBefore & "@@K@@" & countAfter\n'
+        f'  return countBefore & "@@C@@" & stickerPoint & "@@K@@" & countAfter\n'
         f'end tell'
     )
     try:
         raw = _osascript(script, timeout=20)
     except SkillError as e:
         return {"ok": False, "stage": "osascript", "reason": str(e)}
-    if raw == "ABORT_NO_TAB":
-        return {"ok": False, "stage": "locate_tab", "reason": "extension tab not found"}
-    if raw.startswith("ABORT_OPEN@@"):
-        return {"ok": False, "stage": "open_picker", "reason": "sticker button not found",
-                "detail": raw[len("ABORT_OPEN@@"):]}
-    if raw.startswith("ABORT_PICKER@@"):
-        return {"ok": False, "stage": "open_picker", "reason": "picker_unavailable",
-                "detail": ("The sticker picker did not open. Opening it needs a trusted "
-                           "user-activation gesture, which the AppleScript execute-javascript "
-                           "bridge cannot produce. See README (send-sticker).")}
-    if raw.startswith("ABORT_STICKER@@"):
-        try:
-            detail = json.loads(raw[len("ABORT_STICKER@@"):])
-        except Exception:
-            detail = {}
-        return {"ok": False, "stage": "select_sticker",
-                "reason": detail.get("reason", "sticker_not_selected"), "detail": detail}
-    if "@@C@@" not in raw:
-        return {"ok": False, "stage": "unknown", "raw": raw[:300]}
-    before_part, rest = raw.split("@@C@@", 1)
-    click_part, after_part = rest.split("@@K@@", 1)
+    return _parse_send_sticker_result(raw, package_idx, sticker_idx)
 
-    def _j(s):
-        try:
-            return json.loads(s)
-        except Exception:
-            return {}
 
-    before_n = _j(before_part).get("stickerBubbles", 0)
-    after_n = _j(after_part).get("stickerBubbles", 0)
-    if after_n > before_n:
-        return {"ok": True, "verified_by": "sticker_bubble",
-                "package": package_idx, "sticker": sticker_idx}
-    return {"ok": False, "stage": "not_confirmed",
+def _do_send_sticker(sel: dict, loc: dict, package_idx: int, sticker_idx: int) -> dict:
+    """Send a sticker through LINE's real popup using CoreGraphics trusted clicks.
+
+    AppleScript-injected JS runs in an isolated world on Chrome extension pages, so
+    synthetic DOM clicks do not reach LINE's React handlers. The reliable path is:
+    read coordinates with JS, deliver trusted OS clicks, and verify the main chat.
+    """
+
+    js_count_and_open_point = (
+        "var n=document.querySelectorAll('[class*=\"stickerMessageContent-module__content_wrap__\"]').length;"
+        "var ed=document.querySelector('[class*=\"chatroomEditor-module\"]');"
+        "if(!ed)return JSON.stringify({ok:false,reason:'no_editor',stickerBubbles:n});"
+        "var bs=ed.querySelectorAll('button');var b=null;"
+        "for(var j=0;j<bs.length;j++){"
+        "var label=((bs[j].getAttribute('aria-label')||'')+' '+"
+        "(bs[j].getAttribute('title')||'')+' '+(bs[j].textContent||''));"
+        "if(bs[j].getAttribute('data-type')==='sticker'||"
+        "/sticker|스티커|スタンプ|貼圖|贴图/i.test(label)){b=bs[j];break;}"
+        "}"
+        "if(!b)return JSON.stringify({ok:false,reason:'no_sticker_button',stickerBubbles:n});"
+        "var r=b.getBoundingClientRect();"
+        "if(!r.width||!r.height)return JSON.stringify({ok:false,reason:'sticker_button_not_visible',stickerBubbles:n});"
+        "return JSON.stringify({ok:true,stickerBubbles:n,focused:document.hasFocus(),"
+        "x:Math.round(window.screenX+(window.outerWidth-window.innerWidth)/2+r.left+r.width/2),"
+        "y:Math.round(window.screenY+(window.outerHeight-window.innerHeight)+r.top+r.height/2)});"
+    )
+    js_count = (
+        "var n=document.querySelectorAll('[class*=\"stickerMessageContent-module__content_wrap__\"]').length;"
+        "return JSON.stringify({stickerBubbles:n});"
+    )
+    js_popup_target = (
+        f"var PKG={int(package_idx)},STK={int(sticker_idx)};"
+        "function pt(b){var r=b.getBoundingClientRect();return {"
+        "x:Math.round(window.screenX+(window.outerWidth-window.innerWidth)/2+r.left+r.width/2),"
+        "y:Math.round(window.screenY+(window.outerHeight-window.innerHeight)+r.top+r.height/2)};}"
+        "var pkgs=Array.from(document.querySelectorAll('button[class*=\"packageListItem-module__button_package__\"]'));"
+        "if(!pkgs.length)return JSON.stringify({ok:false,reason:'no_packages'});"
+        "if(PKG>=pkgs.length)return JSON.stringify({ok:false,reason:'package_out_of_range',packages:pkgs.length});"
+        "if(pkgs[PKG].getAttribute('aria-selected')!=='true'){"
+        "var pp=pt(pkgs[PKG]);return JSON.stringify({ok:true,action:'click_package',packages:pkgs.length,x:pp.x,y:pp.y});"
+        "}"
+        "var items=Array.from(document.querySelectorAll('button[class*=\"packageItemList-module__button_item__\"]'));"
+        "if(!items.length)return JSON.stringify({ok:false,reason:'empty_package',packages:pkgs.length});"
+        "if(STK>=items.length)return JSON.stringify({ok:false,reason:'sticker_out_of_range',packages:pkgs.length,stickers:items.length});"
+        "var sp=pt(items[STK]);return JSON.stringify({ok:true,action:'click_sticker',packages:pkgs.length,stickers:items.length,x:sp.x,y:sp.y});"
+    )
+
+    try:
+        before_info = {}
+        for i in range(6):
+            if i:
+                time.sleep(0.04)
+            before_info = _json_get(exec_js(js_count_and_open_point, loc, timeout=5, focus=True))
+            if before_info.get("ok") or before_info.get("reason") not in {
+                "no_editor", "no_sticker_button", "sticker_button_not_visible"
+            }:
+                break
+        before_n = int(before_info.get("stickerBubbles") or 0)
+        if not before_info.get("ok"):
+            return {"ok": False, "stage": "open_picker",
+                    "reason": before_info.get("reason", "sticker button not found"),
+                    "detail": before_info}
+
+        if not before_info.get("focused"):
+            try:
+                _focus_chrome_tab(loc)
+            except SkillError:
+                pass
+        click = _trusted_click(int(before_info["x"]), int(before_info["y"]))
+        if not click.get("ok"):
+            return {"ok": False, "stage": "trusted_click",
+                    "reason": "trusted_input_unavailable", "detail": click}
+
+        popup_loc = _find_sticker_popup_tab(timeout=0.6)
+        if not popup_loc:
+            try:
+                _focus_chrome_tab(loc)
+            except SkillError:
+                pass
+            retry_click = _trusted_click(int(before_info["x"]), int(before_info["y"]))
+            if not retry_click.get("ok"):
+                return {"ok": False, "stage": "trusted_click",
+                        "reason": "trusted_input_unavailable", "detail": retry_click}
+            popup_loc = _find_sticker_popup_tab(timeout=0.5)
+            if not popup_loc:
+                return {"ok": False, "stage": "open_picker",
+                        "reason": "picker_unavailable",
+                        "detail": {"first": click, "retry": retry_click}}
+
+        target = {}
+        for _ in range(6):
+            target = _json_get(exec_js(js_popup_target, popup_loc, timeout=5, fallback=False))
+            if target.get("ok") or target.get("reason") in {
+                "package_out_of_range", "sticker_out_of_range", "empty_package", "no_packages"
+            }:
+                break
+            time.sleep(0.04)
+        if not target:
+            return {"ok": False, "stage": "open_picker",
+                    "reason": "picker_unavailable", "detail": "popup closed before selection"}
+        if not target.get("ok"):
+            return {"ok": False, "stage": "select_sticker",
+                    "reason": target.get("reason", "sticker_not_selected"),
+                    "detail": target}
+
+        if target.get("action") == "click_package":
+            click_pkg = _trusted_click(int(target["x"]), int(target["y"]))
+            if not click_pkg.get("ok"):
+                return {"ok": False, "stage": "trusted_click",
+                        "reason": "trusted_input_unavailable", "detail": click_pkg}
+            target = {}
+            for _ in range(6):
+                time.sleep(0.05)
+                target = _json_get(exec_js(js_popup_target, popup_loc, timeout=5, fallback=False))
+                if target.get("action") == "click_sticker" or target.get("reason") in {
+                    "sticker_out_of_range", "empty_package", "no_packages"
+                }:
+                    break
+            if not target.get("ok"):
+                return {"ok": False, "stage": "select_sticker",
+                        "reason": target.get("reason", "sticker_not_selected"),
+                        "detail": target}
+
+        click_sticker = _trusted_click(int(target["x"]), int(target["y"]))
+        if not click_sticker.get("ok"):
+            return {"ok": False, "stage": "trusted_click",
+                    "reason": "trusted_input_unavailable", "detail": click_sticker}
+
+        after_raw = ""
+        after_n = before_n
+        for i in range(6):
+            if i:
+                time.sleep(0.05)
+            after_raw = exec_js(js_count, loc, timeout=5)
+            after_n = _parse_sticker_count(after_raw)
+            if after_n > before_n:
+                break
+        if after_n > before_n:
+            return {
+                "ok": True,
+                "verified_by": "sticker_bubble",
+                "package": package_idx,
+                "sticker": sticker_idx,
+                "trusted_input": "core_graphics",
+                "sticker_bubbles": [before_n, after_n],
+            }
+        return {
+            "ok": False,
+            "stage": "not_confirmed",
             "reason": "no new sticker bubble appeared",
-            "sticker_bubbles": [before_n, after_n]}
+            "sticker_bubbles": [before_n, after_n],
+            "detail": after_raw,
+        }
+    except SkillError as e:
+        return {"ok": False, "stage": "osascript", "reason": str(e)}
 
 
 def cmd_send_sticker(args, sel, sources):
@@ -1928,20 +2440,29 @@ def cmd_send_sticker(args, sel, sources):
     (defaults to the first sticker of the first package). Hot path skips navigation."""
     if not args.to:
         raise SkillError("--to is required")
+    if args.package < 0 or args.sticker < 0:
+        return {"ok": False, "stage": "validate", "reason": "negative_index",
+                "package": args.package, "sticker": args.sticker}
     loc = _require_tab()
     t0 = time.time()
 
     hdr_sel = json.dumps(sel.get("chat_room_header"), ensure_ascii=False)
-    try:
-        header = exec_js(f"return (document.querySelector({hdr_sel})||{{}}).textContent||'';",
-                         loc, timeout=5).strip()
-    except Exception:
-        header = ""
+    header = ""
+    # If the extension is on the chat-list route, no room is open; skip one
+    # AppleScript round trip on the cold path.
+    if "#/chats/" in (loc.get("url") or ""):
+        try:
+            header = exec_js(f"return (document.querySelector({hdr_sel})||{{}}).textContent||'';",
+                             loc, timeout=5).strip()
+        except Exception:
+            header = ""
     on_room = bool(header) and (header == args.to or args.to in header or header in args.to)
     path = "hot"
     if not on_room:
         path = "cold"
-        nav = _navigate_to_room(sel, loc, args.to)
+        nav = _open_visible_room_fast(sel, loc, args.to)
+        if not nav.get("ok"):
+            nav = _navigate_to_room(sel, loc, args.to)
         if not nav.get("ok"):
             return {"ok": False, "stage": "navigate", "reason": nav,
                     "duration_ms": int((time.time() - t0) * 1000)}

@@ -117,6 +117,17 @@ python3 cli.py cache-dump --out ~/line-cache-copy
 
 모든 명령은 JSON을 stdout으로 출력합니다.
 
+## 테스트
+
+```sh
+python3 -m unittest tests/test_send_sticker_contract.py
+LINE_TEST_ONLY=sticker LINE_TEST_ROOM="나만의 그룹" python3 tests/test_reply_sticker.py
+```
+
+첫 번째 명령은 Chrome이나 LINE을 건드리지 않고 `send-sticker`의 JSON/검증 계약을
+확인합니다. 두 번째 명령은 설정한 테스트 방에서만 스티커 라이브 매트릭스를 실행하며,
+hot/cold 경로의 1초 미만 지연 시간까지 확인합니다.
+
 ### `enable-applescript`
 
 AppleScript JS 실행이 켜져 있는지 확인합니다. 꺼져 있으면 Chrome을 앞으로 가져와
@@ -139,13 +150,14 @@ System Events로 `보기 → 개발자 정보 → Apple Events의 자바스크�
 `send-sticker --to R [--package N] [--sticker N]` — 패키지/스티커 인덱스로 지정해
 스티커를 보냅니다 (기본 `0 0` = 첫 패키지의 첫 스티커).
 
-**환경 제약:** LINE 스티커 피커를 여는 것은 *신뢰된(trusted)* 사용자 활성화
-제스처를 요구합니다. AppleScript `execute javascript` 브리지로 주입한 클릭은 사용자
-활성화를 부여하지 못해 피커가 보통 열리지 않습니다. 열 수 없을 때는
-`{"ok": false, "reason": "picker_unavailable"}`를 반환해 명확히 알립니다. 스티커
-전송이 동작하려면 신뢰된 입력 — Chrome DevTools Protocol(`Input.dispatchMouseEvent`)
-또는 macOS 손쉬운 사용 권한을 가진 OS 레벨 합성 클릭 — 이 필요합니다. 피커 구조와
-전송·검증 로직은 구현되어 있어, 신뢰된 입력 경로가 생기는 즉시 동작합니다.
+LINE 스티커 피커를 여는 것은 *신뢰된(trusted)* 사용자 활성화 제스처를 요구하므로,
+`send-sticker`는 macOS CoreGraphics 세션 이벤트로 Chrome 안을 OS 레벨 클릭합니다.
+CLI를 실행하는 터미널 또는 앱에 손쉬운 사용 권한을 부여해야 합니다. 신뢰된 입력을 사용할 수 없으면
+명확히 `{"ok": false, "reason": "trusted_input_unavailable"}`를 반환합니다.
+
+성공 여부는 새 스티커 메시지 버블이 생겼는지로 검증합니다. 음수 인덱스는 LINE을
+건드리기 전에 거절하고, 범위를 벗어난 패키지/스티커 인덱스는 `ok: false` JSON으로
+깨끗하게 실패합니다.
 
 ### `leave-group`
 

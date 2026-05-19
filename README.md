@@ -119,6 +119,17 @@ python3 cli.py cache-dump --out ~/line-cache-copy
 
 All commands print JSON to stdout.
 
+## Tests
+
+```sh
+python3 -m unittest tests/test_send_sticker_contract.py
+LINE_TEST_ONLY=sticker LINE_TEST_ROOM="나만의 그룹" python3 tests/test_reply_sticker.py
+```
+
+The first command checks the `send-sticker` JSON/validation contract without
+touching Chrome or LINE. The second runs the live sticker matrix only in the
+configured test room, including hot/cold latency checks under 1s.
+
 ### `enable-applescript`
 
 Probes whether AppleScript JS execution is on. If off, it brings Chrome to the front
@@ -141,15 +152,15 @@ replied to; if several match, the most recent one is used. Completes in roughly
 `send-sticker --to R [--package N] [--sticker N]` sends a sticker, addressed by
 package/sticker index (default `0 0` — the first sticker of the first package).
 
-**Environment limitation:** opening LINE's sticker picker requires a *trusted*
-user-activation gesture. A JavaScript-injected click via the AppleScript
-`execute javascript` bridge does not grant user activation, so the picker usually
-does not open. When it cannot, the command returns
-`{"ok": false, "reason": "picker_unavailable"}` instead of failing opaquely.
-A working sticker send needs trusted input — Chrome DevTools Protocol
-(`Input.dispatchMouseEvent`) or OS-level synthetic clicks with macOS Accessibility
-permission. The picker structure and the send/verify logic are implemented, so the
-command works as soon as a trusted-input path is available.
+Opening LINE's sticker picker requires a *trusted* user-activation gesture, so
+`send-sticker` uses macOS CoreGraphics session-event clicks in Chrome. Grant
+Accessibility permission to the terminal or app running the CLI. When trusted input
+is unavailable, the command returns `{"ok": false, "reason": "trusted_input_unavailable"}`
+instead of failing opaquely.
+
+Successful sends are verified by detecting a new sticker message bubble. Negative
+indexes are rejected before touching LINE, and out-of-range package/sticker indexes
+return clean `ok: false` JSON responses.
 
 ### `leave-group`
 

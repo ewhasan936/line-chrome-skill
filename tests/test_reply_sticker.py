@@ -5,6 +5,7 @@ Every test sends only into a single test room — set it with the LINE_TEST_ROOM
 env var (use a personal/self group so test traffic bothers nobody):
 
     LINE_TEST_ROOM="나만의 그룹" python3 tests/test_reply_sticker.py
+    LINE_TEST_ONLY=sticker LINE_TEST_ROOM="나만의 그룹" python3 tests/test_reply_sticker.py
 
 Prerequisites: Chrome running, the LINE extension detached into its own window
 and logged in, AppleScript JS execution enabled (`cli.py enable-applescript`).
@@ -20,6 +21,7 @@ import time
 
 CLI = os.path.join(os.path.dirname(__file__), "..", "cli.py")
 ROOM = os.environ.get("LINE_TEST_ROOM")
+ONLY = (os.environ.get("LINE_TEST_ONLY") or "").strip().lower()
 LATENCY_BUDGET_MS = 1000
 
 results = []  # (name, status, detail)
@@ -146,12 +148,6 @@ def test_reply():
 # Sticker tests
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Reasons that mean the sticker picker / packages are not reachable in this
-# environment (the picker needs a trusted user-activation gesture the AppleScript
-# bridge cannot produce). Happy-path sticker tests SKIP — not FAIL — on these.
-PICKER_BLOCKED = {"picker_unavailable", "no_packages", "empty_package"}
-
-
 def test_sticker():
     print("\n# send-sticker")
 
@@ -159,37 +155,64 @@ def test_sticker():
     rc, _, _, _ = cli("send-sticker")
     record("S5 missing args rejected", rc == 2, f"exit={rc}")
 
-    # S1/S4/S6: happy path + latency + verification.
+    # S8: invalid negative indexes fail before touching Chrome/LINE.
+    rc, d, out, _ = cli("send-sticker", "--to", ROOM, "--package", "-1")
+    record("S8 negative package index rejected",
+           bool(d and not d.get("ok") and d.get("reason") == "negative_index"),
+           f"reason={d and d.get('reason')}")
+    rc, d, out, _ = cli("send-sticker", "--to", ROOM, "--sticker", "-1")
+    record("S9 negative sticker index rejected",
+           bool(d and not d.get("ok") and d.get("reason") == "negative_index"),
+           f"reason={d and d.get('reason')}")
+
+    if ONLY == "sticker":
+        # In sticker-only mode, no reply setup has opened the room yet. Send once
+        # through the normal command to put LINE on ROOM before the hot-path case.
+        rc, d, out, _ = cli("send-sticker", "--to", ROOM, "--package", "0", "--sticker", "0")
+        record("S0 sticker-only setup opens test room",
+               bool(d and d.get("ok") and d.get("room") == ROOM),
+               f"path={d and d.get('path')} {d and d.get('duration_ms')}ms {out[:120] if not (d and d.get('ok')) else ''}")
+
+    # S1/S4/S6/S10: hot happy path + latency + sticker-bubble verification.
+    # test_reply or the sticker-only setup leaves the current room on ROOM.
     rc, d, out, _ = cli("send-sticker", "--to", ROOM)
-    blocked = bool(d and not d.get("ok") and d.get("reason") in PICKER_BLOCKED)
-    if d and d.get("ok"):
-        record("S1 send-sticker happy path", True, f"{d.get('duration_ms')}ms")
-        record("S4 send-sticker latency < 1s",
-               d.get("duration_ms", 9e9) < LATENCY_BUDGET_MS, f"{d.get('duration_ms')}ms")
-        record("S6 sticker bubble verified", d.get("verified_by") == "sticker_bubble",
-               f"verified_by={d.get('verified_by')}")
-    elif blocked:
-        why = f"environment-blocked ({d.get('reason')}) — sticker picker needs trusted input"
-        skip("S1 send-sticker happy path", why)
-        skip("S4 send-sticker latency < 1s", "blocked by S1")
-        skip("S6 sticker bubble verified", "blocked by S1")
-    else:
-        record("S1 send-sticker happy path", False, f"{out[:160]}")
+    ok = bool(d and d.get("ok"))
+    record("S1 hot send-sticker happy path", ok, f"{d and d.get('duration_ms')}ms {out[:120] if not ok else ''}")
+    record("S4 hot send-sticker latency < 1s",
+           ok and d.get("duration_ms", 9e9) < LATENCY_BUDGET_MS,
+           f"{d and d.get('duration_ms')}ms (budget {LATENCY_BUDGET_MS})")
+    record("S6 sticker bubble verified",
+           ok and d.get("verified_by") == "sticker_bubble",
+           f"verified_by={d and d.get('verified_by')}")
+    record("S10 hot path reported", ok and d.get("path") == "hot",
+           f"path={d and d.get('path')}")
 
     # S2: address a sticker by package/index.
     rc, d, out, _ = cli("send-sticker", "--to", ROOM, "--package", "0", "--sticker", "0")
-    if d and d.get("ok"):
-        record("S2 send-sticker by index", True)
-    elif d and not d.get("ok") and d.get("reason") in PICKER_BLOCKED:
-        skip("S2 send-sticker by index", f"environment-blocked ({d.get('reason')})")
-    else:
-        record("S2 send-sticker by index", False, f"{out[:120]}")
+    record("S2 send-sticker by explicit index",
+           bool(d and d.get("ok") and d.get("package") == 0 and d.get("sticker") == 0),
+           f"{out[:120] if not (d and d.get('ok')) else ''}")
+
+    # S11/S12: cold path must navigate to ROOM and still stay under the 1s budget.
+    reload_tab()
+    rc, d, out, _ = cli("send-sticker", "--to", ROOM, "--package", "0", "--sticker", "0")
+    cold_ok = bool(d and d.get("ok") and d.get("path") == "cold")
+    record("S11 cold send-sticker happy path", cold_ok,
+           f"path={d and d.get('path')} {d and d.get('duration_ms')}ms")
+    record("S12 cold send-sticker latency < 1s",
+           cold_ok and d.get("duration_ms", 9e9) < LATENCY_BUDGET_MS,
+           f"{d and d.get('duration_ms')}ms (budget {LATENCY_BUDGET_MS})")
 
     # S3: invalid index -> clean (ok:false) failure. The command must never crash or
     # falsely succeed on a bad index — verifiable regardless of picker availability.
     rc, d, out, _ = cli("send-sticker", "--to", ROOM, "--package", "999", "--sticker", "999")
-    record("S3 invalid index fails cleanly, no crash",
-           bool(d is not None and not d.get("ok")),
+    record("S3 invalid package index fails cleanly, no crash",
+           bool(d is not None and not d.get("ok") and d.get("reason") == "package_out_of_range"),
+           f"reason={d and d.get('reason')}")
+
+    rc, d, out, _ = cli("send-sticker", "--to", ROOM, "--package", "0", "--sticker", "999")
+    record("S7 invalid sticker index fails cleanly, no crash",
+           bool(d is not None and not d.get("ok") and d.get("reason") == "sticker_out_of_range"),
            f"reason={d and d.get('reason')}")
 
 
@@ -197,9 +220,14 @@ def main():
     if not ROOM:
         print("ERROR: set LINE_TEST_ROOM (e.g. LINE_TEST_ROOM='나만의 그룹')")
         sys.exit(2)
+    if ONLY not in ("", "reply", "sticker"):
+        print("ERROR: LINE_TEST_ONLY must be empty, 'reply', or 'sticker'")
+        sys.exit(2)
     print(f"Test room: {ROOM!r}   latency budget: {LATENCY_BUDGET_MS}ms")
-    test_reply()
-    test_sticker()
+    if ONLY in ("", "reply"):
+        test_reply()
+    if ONLY in ("", "sticker"):
+        test_sticker()
 
     print("\n" + "=" * 56)
     p = sum(1 for _, s, _ in results if s == "PASS")
