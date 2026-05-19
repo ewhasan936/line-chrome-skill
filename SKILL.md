@@ -38,6 +38,12 @@ python3 cli.py reply --room "Family" --to "see you at 6" --text "got it"
 python3 cli.py send-sticker --to "Family"        # see "Stickers" note below
 python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "회의"
+python3 cli.py brief --room "Family" --room "Team"
+python3 cli.py needs-reply --room "Team"
+python3 cli.py tone-profiles set polite --prefix "안녕하세요. " --suffix " 감사합니다."
+python3 cli.py follow-ups add --room "Team" --text "답변 확인" --in 2h
+python3 cli.py schedule add --to "Team" --text "스탠드업 시간입니다" --at "2030-01-02 09:00"
+python3 cli.py allowed-rooms enable
 python3 cli.py leave-group --room "Old Group" --confirm   # irreversible — see below
 python3 cli.py watch --interval 5         # poll for new messages
 python3 cli.py selectors show
@@ -47,6 +53,27 @@ python3 cli.py cache-dump --out ~/line-cache-copy
 ```
 
 All commands print JSON to stdout.
+
+## Daily automation commands
+
+- `brief` / `daily-brief`: read recent messages across explicit rooms (or visible
+  rooms if none are supplied) and return structured JSON with message counts,
+  previews, question/request counts, likely reply-needed items, and a conversation
+  summary at `summary.text`. With no room supplied, it reads the currently open
+  room once for sub-second response.
+- `needs-reply` / `inbox`: list received question/request-like messages after the
+  user's latest sent message in each scanned room. `--max-runtime-ms` bounds
+  multi-room scans and reports skipped rooms instead of hanging.
+- `tone-profiles`: store manual room profiles as prefix/suffix transforms. `send`
+  and `reply` apply a room's assigned profile unless `--no-profile` is provided.
+- `follow-ups`: maintain local reminders. `send` and `reply` can create a reminder
+  with `--follow-up-in 2h` or `--follow-up-at "2030-01-02 09:00"` after a verified
+  successful send.
+- `schedule`: store pending text or sticker sends. It is a queue, not a daemon;
+  run `python3 cli.py schedule run` from cron/launchd to send due items.
+- `allowed-rooms`: outbound safety rail. When enabled, `send`, `reply`,
+  `send-sticker`, `leave-group`, and `schedule add/run` refuse non-allowed rooms
+  before touching Chrome.
 
 ## Replying to a message (`reply`)
 

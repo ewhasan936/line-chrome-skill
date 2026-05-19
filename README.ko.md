@@ -107,6 +107,15 @@ python3 cli.py reply --room "Family" --to "6시에 보자" --text "알겠어"
 python3 cli.py send-sticker --to "Family"   # 아래 "스티커" 참고
 python3 cli.py send-sticker --to "Family" --meaning thanks
 python3 cli.py sticker-tags set thanks --package 0 --sticker 3 --label "고마워"
+python3 cli.py brief --room "Family" --room "Team"
+python3 cli.py needs-reply --room "Team"
+python3 cli.py tone-profiles set polite --prefix "안녕하세요. " --suffix " 감사합니다."
+python3 cli.py tone-profiles assign "Team" --profile polite
+python3 cli.py follow-ups add --room "Team" --text "답변 확인" --in 2h
+python3 cli.py schedule add --to "Team" --text "스탠드업 시간입니다" --at "2030-01-02 09:00"
+python3 cli.py schedule run --dry-run
+python3 cli.py allowed-rooms add "나만의 그룹"
+python3 cli.py allowed-rooms enable
 python3 cli.py leave-group --room "Old Group" --confirm   # 되돌릴 수 없음 — 아래 참고
 python3 cli.py watch --interval 5         # 새 메시지 폴링 (Ctrl-C로 중지)
 
@@ -139,6 +148,66 @@ System Events로 `보기 → 개발자 정보 → Apple Events의 자바스크�
 
 참고: Chrome은 이 설정을 AppleScript로 **끄는** 것은 차단합니다 — 켜는 방향만
 자동화 가능하며, 이 명령에는 그것으로 충분합니다.
+
+## 매일 쓰는 자동화
+
+`brief`는 최근 메시지를 훑어 방별 메시지 수, 최근 미리보기, 질문/요청 수, 답장이
+필요해 보이는 항목, 그리고 `summary.text` 대화 요약을 JSON으로 반환합니다. 방을
+지정하지 않으면 현재 열린 방을 한 번만 읽는 빠른 경로를 사용합니다. 여러 방을 지정할
+수 있지만, 기본 `--max-runtime-ms 900` 예산을 넘기면 남은 방은 `deadline_exceeded`로
+표시됩니다.
+
+```sh
+python3 cli.py brief --room "Family" --room "Team" --limit 50
+python3 cli.py daily-brief --rooms "Family,Team" --preview 3 --max-runtime-ms 1500
+```
+
+`needs-reply`는 마지막으로 내가 보낸 메시지 이후의 수신 메시지 중 질문/요청 표현이 있는
+항목을 모읍니다. 방을 지정하지 않으면 현재 열린 방을 빠르게 읽고, `--max-runtime-ms`로
+여러 방 스캔의 시간 예산을 조정할 수 있습니다.
+
+```sh
+python3 cli.py needs-reply --room "Team"
+python3 cli.py inbox --rooms "Family,Team" --include-before-last-sent
+```
+
+`tone-profiles`는 방별 말투를 수동 프로필로 저장합니다. 현재 구현은 LLM으로 문체를
+재작성하지 않고, 사용자가 정한 prefix/suffix를 적용합니다.
+
+```sh
+python3 cli.py tone-profiles set polite --prefix "안녕하세요. " --suffix " 감사합니다."
+python3 cli.py tone-profiles assign "Team" --profile polite
+python3 cli.py send --to "Team" --text "확인했습니다"   # 프로필 자동 적용
+python3 cli.py send --to "Team" --text "확인했습니다" --no-profile
+```
+
+`follow-ups`는 로컬 리마인더입니다. `send`/`reply`에도 `--follow-up-in` 또는
+`--follow-up-at`을 붙이면 전송 성공 후 자동으로 항목을 남깁니다.
+
+```sh
+python3 cli.py follow-ups add --room "Team" --text "답변 확인" --in 2h
+python3 cli.py follow-ups due
+python3 cli.py send --to "Team" --text "확인 부탁드립니다" --follow-up-in 1d
+```
+
+`schedule`은 예약 발송 큐입니다. 백그라운드 데몬을 띄우지는 않으므로, 실제 발송은
+`schedule run`을 `cron`이나 `launchd`에서 주기적으로 실행해 처리합니다.
+
+```sh
+python3 cli.py schedule add --to "Team" --text "스탠드업 시간입니다" --at "2030-01-02 09:00"
+python3 cli.py schedule add --to "Team" --text "오늘 공유할 이슈를 올려주세요" --in 10m
+python3 cli.py schedule run
+```
+
+`allowed-rooms`는 발신 안전장치입니다. 활성화하면 `send`, `reply`, `send-sticker`,
+`leave-group`, `schedule add/run`이 허용 목록 밖의 방에는 Chrome을 건드리기 전에
+실패합니다.
+
+```sh
+python3 cli.py allowed-rooms add "나만의 그룹"
+python3 cli.py allowed-rooms enable
+python3 cli.py allowed-rooms show
+```
 
 ### `reply`
 

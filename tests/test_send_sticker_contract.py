@@ -152,6 +152,7 @@ class SendStickerValidationTests(unittest.TestCase):
                 }
 
             with mock.patch.object(cli, "USER_STICKER_TAGS_PATH", path), \
+                    mock.patch.object(cli, "USER_ALLOWED_ROOMS_PATH", Path(td) / "allowed-rooms.json"), \
                     mock.patch.object(cli, "_require_tab", return_value={"url": "chrome-extension://x/index.html#/chats"}), \
                     mock.patch.object(cli, "_open_visible_room_fast", return_value={"ok": True}), \
                     mock.patch.object(cli, "_do_send_sticker", side_effect=fake_send):

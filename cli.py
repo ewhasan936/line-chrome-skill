@@ -9,8 +9,10 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+from datetime import datetime, timedelta
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +34,10 @@ SKILL_DIR = Path(__file__).resolve().parent
 DEFAULT_SEL_PATH = SKILL_DIR / "selectors.json"
 USER_SEL_PATH = Path.home() / ".config" / "line-chrome" / "selectors.json"
 USER_STICKER_TAGS_PATH = Path.home() / ".config" / "line-chrome" / "stickers.json"
+USER_TONE_PROFILES_PATH = Path.home() / ".config" / "line-chrome" / "tone-profiles.json"
+USER_FOLLOW_UPS_PATH = Path.home() / ".config" / "line-chrome" / "follow-ups.json"
+USER_SCHEDULE_PATH = Path.home() / ".config" / "line-chrome" / "scheduled-sends.json"
+USER_ALLOWED_ROOMS_PATH = Path.home() / ".config" / "line-chrome" / "allowed-rooms.json"
 EXTENSION_ID = "ophjlpahpchlmihnnnihgmmeilfjmjjc"
 EXTENSION_PREFIX = f"chrome-extension://{EXTENSION_ID}/"
 
@@ -46,6 +52,28 @@ def _load_json(path: Path) -> dict:
         return {}
     except json.JSONDecodeError as e:
         raise SkillError(f"selectors file at {path} has invalid JSON: {e}")
+
+
+def _clone_doc(doc: dict) -> dict:
+    return json.loads(json.dumps(doc))
+
+
+def _load_config_doc(path: Path, label: str, default: dict) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        return _clone_doc(default)
+    except json.JSONDecodeError as e:
+        raise SkillError(f"{label} file at {path} has invalid JSON: {e}")
+    if not isinstance(doc, dict):
+        raise SkillError(f"{label} file at {path} must contain a JSON object")
+    return doc
+
+
+def _write_config_doc(path: Path, doc: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def load_selectors(cli_overrides: list[str]) -> tuple[dict, dict]:
@@ -585,6 +613,7 @@ return go();
 def js_history(selectors: dict, limit: int) -> str:
     return f"""
 const sel = {json.dumps(selectors, ensure_ascii=False)};
+const headerEl = document.querySelector(sel.chat_room_header);
 const bubblesAll = document.querySelectorAll(sel.message_bubble);
 // LINE renders newest-first in DOM. Take the first `limit` (= newest) and emit
 // in chronological order (oldest → newest) for natural reading.
@@ -623,7 +652,7 @@ for (let i = 0; i < bubbles.length; i++) {{
     timestamp: ts ? (ts.getAttribute('datetime') || ts.textContent.trim()) : (b.getAttribute('data-timestamp') || null),
   }});
 }}
-return JSON.stringify({{ count: out.length, messages: out }});
+return JSON.stringify({{ header: headerEl ? (headerEl.textContent || '').trim() : '', count: out.length, messages: out }});
 """
 
 
@@ -1164,6 +1193,441 @@ def _send_with_verify(sel: dict, loc: dict, text: str) -> dict:
             "text": text, "bubbles": [initial_bubbles, final_bubbles]}
 
 
+# ── Productivity feature helpers ────────────────────────────────────────────
+
+def _now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _format_dt(dt: datetime) -> str:
+    return dt.astimezone().isoformat(timespec="seconds")
+
+
+def _parse_datetime(value: str) -> datetime:
+    raw = (value or "").strip()
+    if not raw:
+        raise SkillError("datetime value is required")
+    normalized = raw.replace(" ", "T", 1)
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise SkillError(
+            "datetime must be ISO-like, e.g. 2030-01-02T09:00 or '2030-01-02 09:00'"
+        )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_now().tzinfo)
+    return dt.astimezone()
+
+
+def _parse_duration(value: str) -> timedelta:
+    raw = (value or "").strip().lower().replace(" ", "")
+    if not raw:
+        raise SkillError("duration value is required")
+    total = timedelta()
+    pos = 0
+    units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
+    for m in re.finditer(r"(\d+)([smhdw])", raw):
+        if m.start() != pos:
+            raise SkillError("duration must look like 10m, 2h, 1d, or 1h30m")
+        n = int(m.group(1))
+        unit = units[m.group(2)]
+        total += timedelta(**{unit: n})
+        pos = m.end()
+    if pos != len(raw) or total.total_seconds() <= 0:
+        raise SkillError("duration must look like 10m, 2h, 1d, or 1h30m")
+    return total
+
+
+def _due_at_from_args(at_value: str | None, in_value: str | None) -> str:
+    if bool(at_value) == bool(in_value):
+        raise SkillError("provide exactly one of --at or --in")
+    dt = _parse_datetime(at_value) if at_value else _now() + _parse_duration(in_value or "")
+    return _format_dt(dt)
+
+
+def _next_config_id(doc: dict, prefix: str) -> str:
+    n = int(doc.get("next_id", 1))
+    doc["next_id"] = n + 1
+    return f"{prefix}-{n:04d}"
+
+
+def _load_allowed_rooms_doc() -> dict:
+    doc = _load_config_doc(
+        USER_ALLOWED_ROOMS_PATH,
+        "allowed rooms",
+        {"version": 1, "enabled": False, "rooms": []},
+    )
+    doc.setdefault("version", 1)
+    doc.setdefault("enabled", False)
+    rooms = doc.setdefault("rooms", [])
+    if not isinstance(rooms, list):
+        raise SkillError(f"allowed rooms file at {USER_ALLOWED_ROOMS_PATH} must contain a list at `rooms`")
+    return doc
+
+
+def _write_allowed_rooms_doc(doc: dict) -> None:
+    _write_config_doc(USER_ALLOWED_ROOMS_PATH, doc)
+
+
+def _normalize_room_name(room: str) -> str:
+    return (room or "").strip().casefold()
+
+
+def _room_matches(requested: str, actual: str) -> bool:
+    requested = (requested or "").strip()
+    actual = (actual or "").strip()
+    return bool(requested and actual) and (
+        requested == actual or requested in actual or actual in requested
+    )
+
+
+def _allowed_room_failure(room: str, command: str) -> dict | None:
+    doc = _load_allowed_rooms_doc()
+    if not doc.get("enabled"):
+        return None
+    allowed = [str(r) for r in doc.get("rooms", [])]
+    room_norm = _normalize_room_name(room)
+    allowed_norm = {_normalize_room_name(r) for r in allowed}
+    if room_norm in allowed_norm:
+        return None
+    return {
+        "ok": False,
+        "stage": "allowed_rooms",
+        "reason": "room_not_allowed",
+        "command": command,
+        "room": room,
+        "allowed_rooms": allowed,
+        "config": str(USER_ALLOWED_ROOMS_PATH),
+    }
+
+
+def _load_tone_profiles_doc() -> dict:
+    doc = _load_config_doc(
+        USER_TONE_PROFILES_PATH,
+        "tone profiles",
+        {"version": 1, "profiles": {}, "rooms": {}},
+    )
+    doc.setdefault("version", 1)
+    profiles = doc.setdefault("profiles", {})
+    rooms = doc.setdefault("rooms", {})
+    if not isinstance(profiles, dict) or not isinstance(rooms, dict):
+        raise SkillError(f"tone profiles file at {USER_TONE_PROFILES_PATH} has invalid shape")
+    return doc
+
+
+def _write_tone_profiles_doc(doc: dict) -> None:
+    _write_config_doc(USER_TONE_PROFILES_PATH, doc)
+
+
+def _profile_message_text(room: str, text: str, profile_name: str | None = None,
+                          no_profile: bool = False) -> dict:
+    if no_profile:
+        return {"text": text, "applied": False}
+    doc = _load_tone_profiles_doc()
+    requested = (profile_name or "").strip() or str(doc.get("rooms", {}).get(room, "")).strip()
+    if not requested:
+        return {"text": text, "applied": False}
+    profiles = doc.get("profiles", {})
+    profile = profiles.get(requested)
+    if not isinstance(profile, dict):
+        raise SkillError(f"tone profile '{requested}' is not defined")
+    prefix = str(profile.get("prefix", ""))
+    suffix = str(profile.get("suffix", ""))
+    transformed = f"{prefix}{text}{suffix}"
+    return {
+        "text": transformed,
+        "applied": transformed != text,
+        "profile": requested,
+        "original_text": text,
+        "prefix": prefix,
+        "suffix": suffix,
+    }
+
+
+def _attach_profile_result(result: dict, profiled: dict) -> dict:
+    if profiled.get("profile"):
+        result["profile"] = profiled.get("profile")
+        result["original_text"] = profiled.get("original_text")
+        if profiled.get("applied"):
+            result["profile_applied"] = True
+    return result
+
+
+def _load_followups_doc() -> dict:
+    doc = _load_config_doc(
+        USER_FOLLOW_UPS_PATH,
+        "follow-ups",
+        {"version": 1, "next_id": 1, "items": []},
+    )
+    doc.setdefault("version", 1)
+    doc.setdefault("next_id", 1)
+    items = doc.setdefault("items", [])
+    if not isinstance(items, list):
+        raise SkillError(f"follow-ups file at {USER_FOLLOW_UPS_PATH} must contain a list at `items`")
+    return doc
+
+
+def _write_followups_doc(doc: dict) -> None:
+    _write_config_doc(USER_FOLLOW_UPS_PATH, doc)
+
+
+def _add_followup(room: str, text: str, due_at: str, source: str = "manual",
+                  related_text: str | None = None) -> dict:
+    doc = _load_followups_doc()
+    item = {
+        "id": _next_config_id(doc, "fu"),
+        "room": room,
+        "text": text,
+        "due_at": due_at,
+        "status": "open",
+        "source": source,
+        "created_at": _format_dt(_now()),
+    }
+    if related_text:
+        item["related_text"] = related_text
+    doc["items"].append(item)
+    _write_followups_doc(doc)
+    return item
+
+
+def _maybe_add_followup_from_send(args, result: dict) -> None:
+    at_value = getattr(args, "follow_up_at", None)
+    in_value = getattr(args, "follow_up_in", None)
+    if not at_value and not in_value:
+        return
+    note = getattr(args, "follow_up_note", None) or "Follow up on this LINE message"
+    room = getattr(args, "to", None) or getattr(args, "room", None) or result.get("room")
+    if not room:
+        return
+    due_at = _due_at_from_args(at_value, in_value)
+    item = _add_followup(room, note, due_at, source="send", related_text=getattr(args, "text", None))
+    result["follow_up"] = item
+
+
+def _validate_optional_followup(args) -> str | None:
+    at_value = getattr(args, "follow_up_at", None)
+    in_value = getattr(args, "follow_up_in", None)
+    if not at_value and not in_value:
+        return None
+    return _due_at_from_args(at_value, in_value)
+
+
+def _load_schedule_doc() -> dict:
+    doc = _load_config_doc(
+        USER_SCHEDULE_PATH,
+        "scheduled sends",
+        {"version": 1, "next_id": 1, "items": []},
+    )
+    doc.setdefault("version", 1)
+    doc.setdefault("next_id", 1)
+    items = doc.setdefault("items", [])
+    if not isinstance(items, list):
+        raise SkillError(f"scheduled sends file at {USER_SCHEDULE_PATH} must contain a list at `items`")
+    return doc
+
+
+def _write_schedule_doc(doc: dict) -> None:
+    _write_config_doc(USER_SCHEDULE_PATH, doc)
+
+
+def _is_due(iso_value: str, now: datetime | None = None) -> bool:
+    try:
+        return _parse_datetime(iso_value) <= (now or _now())
+    except SkillError:
+        return False
+
+
+def _with_overdue(item: dict, now: datetime | None = None) -> dict:
+    now = now or _now()
+    out = dict(item)
+    try:
+        due = _parse_datetime(str(item.get("at") or item.get("due_at") or ""))
+        out["overdue_seconds"] = max(0, int((now - due).total_seconds()))
+    except SkillError:
+        out["overdue_seconds"] = None
+    return out
+
+
+def _next_repeated_at(current_at: str, repeat: str) -> str:
+    repeat = (repeat or "none").strip().lower()
+    dt = _parse_datetime(current_at)
+    now = _now()
+    if repeat == "daily":
+        step = timedelta(days=1)
+        while dt <= now:
+            dt += step
+        return _format_dt(dt)
+    if repeat == "weekdays":
+        while True:
+            dt += timedelta(days=1)
+            if dt.weekday() < 5 and dt > now:
+                return _format_dt(dt)
+    raise SkillError(f"unknown repeat value '{repeat}'")
+
+
+def _room_args(args) -> list[str]:
+    rooms: list[str] = []
+    for room in getattr(args, "room", []) or []:
+        if room and room.strip():
+            rooms.append(room.strip())
+    rooms_csv = getattr(args, "rooms", None)
+    if rooms_csv:
+        rooms.extend([r.strip() for r in rooms_csv.split(",") if r.strip()])
+    seen = set()
+    out = []
+    for room in rooms:
+        key = _normalize_room_name(room)
+        if key not in seen:
+            seen.add(key)
+            out.append(room)
+    return out
+
+
+def _default_visible_rooms(sel: dict, limit: int) -> list[str]:
+    loc = _require_tab()
+    raw = exec_js(js_list_rooms(sel, limit), loc)
+    data = json.loads(raw)
+    rooms = [r.get("name") for r in data.get("rooms", []) if r.get("name")]
+    if rooms:
+        return rooms
+    hdr_sel = json.dumps(sel.get("chat_room_header"), ensure_ascii=False)
+    header = exec_js(
+        f"return (document.querySelector({hdr_sel})||{{}}).textContent||'';",
+        loc,
+        timeout=5,
+    ).strip()
+    return [header] if header else []
+
+
+def _reply_candidate_reasons(text: str) -> list[str]:
+    t = (text or "").strip()
+    if not t:
+        return []
+    reasons = []
+    if "?" in t or "？" in t:
+        reasons.append("question_mark")
+    if re.search(r"(까요|나요|습니까|줄래|줄 수|가능|어때|언제|어디|누구|뭐|왜|어떻게)", t):
+        reasons.append("question_or_request_phrase")
+    if re.search(r"(확인|알려|보내|공유|부탁|필요|가능할|될까요|해주세요|해줘)", t):
+        reasons.append("request_phrase")
+    return reasons
+
+
+def _find_needs_reply(messages: list[dict], include_before_last_sent: bool = False) -> list[dict]:
+    last_sent = -1
+    for i, msg in enumerate(messages):
+        if msg.get("direction") == "sent":
+            last_sent = i
+    candidates = []
+    for i, msg in enumerate(messages):
+        if msg.get("direction") != "received":
+            continue
+        if not include_before_last_sent and i <= last_sent:
+            continue
+        reasons = _reply_candidate_reasons(str(msg.get("text") or ""))
+        if not reasons:
+            continue
+        item = dict(msg)
+        item["history_index"] = i
+        item["reasons"] = reasons
+        item["after_last_sent"] = i > last_sent
+        candidates.append(item)
+    return candidates
+
+
+def _clean_brief_text(text: Any, max_len: int = 120) -> str:
+    cleaned = re.sub(r"[\u200b-\u200f]", "", str(text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s*읽음$", "", cleaned).strip()
+    if len(cleaned) > max_len:
+        return cleaned[:max_len - 1].rstrip() + "…"
+    return cleaned
+
+
+def _brief_speaker(msg: dict) -> str:
+    if msg.get("direction") == "sent":
+        return "나"
+    return _clean_brief_text(msg.get("author"), max_len=40) or "상대"
+
+
+def _conversation_summary(room: str, messages: list[dict], questions: list[dict],
+                          needs: list[dict]) -> dict:
+    non_empty = [m for m in messages if _clean_brief_text(m.get("text"))]
+    if not non_empty:
+        return {
+            "text": "최근 로드된 메시지가 없습니다.",
+            "recent_flow": [],
+            "open_questions": [],
+        }
+
+    recent = non_empty[-5:]
+    recent_flow = [
+        {
+            "speaker": _brief_speaker(msg),
+            "direction": msg.get("direction"),
+            "text": _clean_brief_text(msg.get("text")),
+            "timestamp": msg.get("timestamp"),
+        }
+        for msg in recent
+    ]
+    open_questions = [
+        {
+            "speaker": _brief_speaker(q),
+            "text": _clean_brief_text(q.get("text")),
+            "direction": q.get("direction"),
+        }
+        for q in questions[-3:]
+        if _clean_brief_text(q.get("text"))
+    ]
+    latest = recent_flow[-1]
+    flow_text = " / ".join(f"{item['speaker']}: {item['text']}" for item in recent_flow[-3:])
+    parts = [
+        f"{room} 최근 대화는 {len(messages)}개 메시지 기준입니다.",
+        f"최근 흐름: {flow_text}.",
+        f"마지막 메시지는 {latest['speaker']}의 \"{latest['text']}\"입니다.",
+    ]
+    if needs:
+        parts.append(f"아직 답장 필요로 보이는 항목은 {len(needs)}개입니다.")
+    elif questions:
+        parts.append(f"질문/요청 표현은 {len(questions)}개 있었지만, 현재 답장 필요 후보는 없습니다.")
+    else:
+        parts.append("뚜렷한 질문/요청 표현은 없습니다.")
+    return {
+        "text": " ".join(parts),
+        "recent_flow": recent_flow,
+        "open_questions": open_questions,
+    }
+
+
+def _brief_from_messages(room: str, messages: list[dict], preview: int) -> dict:
+    sent = [m for m in messages if m.get("direction") == "sent"]
+    received = [m for m in messages if m.get("direction") == "received"]
+    questions = []
+    for i, msg in enumerate(messages):
+        reasons = _reply_candidate_reasons(str(msg.get("text") or ""))
+        if reasons:
+            questions.append({"index": i, "text": msg.get("text"), "reasons": reasons,
+                              "direction": msg.get("direction"), "author": msg.get("author")})
+    needs = _find_needs_reply(messages)
+    summary = _conversation_summary(room, messages, questions, needs)
+    return {
+        "room": room,
+        "message_count": len(messages),
+        "received_count": len(received),
+        "sent_count": len(sent),
+        "question_or_request_count": len(questions),
+        "needs_reply_count": len(needs),
+        "latest_message": messages[-1] if messages else None,
+        "latest_received": received[-1] if received else None,
+        "summary": summary,
+        "summary_text": summary["text"],
+        "preview": messages[-preview:] if preview > 0 else [],
+        "needs_reply": needs,
+    }
+
+
 # ── Subcommands ──────────────────────────────────────────────────────────────
 
 def _probe_applescript_js() -> dict:
@@ -1291,6 +1755,9 @@ def cmd_leave_group(args, sel, sources):
                 "진행하시겠습니까?\"), then re-run with --confirm."
             ),
         }
+    allowed_failure = _allowed_room_failure(args.room, "leave-group")
+    if allowed_failure:
+        return allowed_failure
 
     loc = _require_tab()
     nav = _navigate_to_room(sel, loc, args.room)
@@ -1532,16 +1999,29 @@ def cmd_list_contacts(args, sel, sources):
 def cmd_send(args, sel, sources):
     if not args.to or not args.text:
         raise SkillError("--to and --text are required")
+    allowed_failure = _allowed_room_failure(args.to, "send")
+    if allowed_failure:
+        return allowed_failure
+    profiled = _profile_message_text(
+        args.to,
+        args.text,
+        getattr(args, "profile", None),
+        bool(getattr(args, "no_profile", False)),
+    )
+    _validate_optional_followup(args)
+    text = profiled["text"]
     loc = _require_tab()
     t0 = time.time()
 
     # FAST PATH: read header + send + poll for clear, all in one osascript.
     # If we're already on the target chat, this completes in 150-500ms.
-    fast = _try_fast_send(sel, loc, args.to, args.text)
+    fast = _try_fast_send(sel, loc, args.to, text)
     if fast.get("ok"):
         fast["room"] = args.to
         fast["duration_ms"] = int((time.time() - t0) * 1000)
         fast["path"] = "hot"
+        _attach_profile_result(fast, profiled)
+        _maybe_add_followup_from_send(args, fast)
         return fast
 
     # COLD PATH: combined nav+send in one osascript (fastest), with fallback chain.
@@ -1556,11 +2036,13 @@ def cmd_send(args, sel, sources):
 
     last_failure = None
     for q in candidate_queries:
-        combined = _try_combined_send(sel, loc, args.to, args.text, q)
+        combined = _try_combined_send(sel, loc, args.to, text, q)
         if combined.get("ok"):
             combined["room"] = combined.get("matched") or args.to
             combined["duration_ms"] = int((time.time() - t0) * 1000)
             combined["path"] = "cold"
+            _attach_profile_result(combined, profiled)
+            _maybe_add_followup_from_send(args, combined)
             try:
                 exec_js(js_set_search(sel, ""), loc, timeout=5)
             except Exception:
@@ -1577,10 +2059,13 @@ def cmd_send(args, sel, sources):
         return {"ok": False, "stage": "navigate", "reason": nav,
                 "duration_ms": int((time.time() - t0) * 1000),
                 "combined_failure": last_failure}
-    send_result = _send_with_verify(sel, loc, args.text)
+    send_result = _send_with_verify(sel, loc, text)
     send_result["room"] = nav.get("matched")
     send_result["duration_ms"] = int((time.time() - t0) * 1000)
     send_result["path"] = "cold-deep"
+    _attach_profile_result(send_result, profiled)
+    if send_result.get("ok"):
+        _maybe_add_followup_from_send(args, send_result)
     try:
         exec_js(js_set_search(sel, ""), loc, timeout=5)
     except Exception:
@@ -1854,6 +2339,17 @@ def cmd_reply(args, sel, sources):
     replied to; --text is the reply body. Hot path skips navigation when already in the room."""
     if not args.room or not args.to or not args.text:
         raise SkillError("--room, --to and --text are required")
+    allowed_failure = _allowed_room_failure(args.room, "reply")
+    if allowed_failure:
+        return allowed_failure
+    profiled = _profile_message_text(
+        args.room,
+        args.text,
+        getattr(args, "profile", None),
+        bool(getattr(args, "no_profile", False)),
+    )
+    _validate_optional_followup(args)
+    text = profiled["text"]
     loc = _require_tab()
     t0 = time.time()
 
@@ -1867,11 +2363,11 @@ def cmd_reply(args, sel, sources):
 
     if on_room:
         # HOT: already in the room — reply directly, no navigation.
-        result = _do_reply(sel, loc, args.to, args.text)
+        result = _do_reply(sel, loc, args.to, text)
         result["path"] = "hot"
     else:
         # COLD: fold navigation into the same osascript as the reply.
-        result = _do_reply(sel, loc, args.to, args.text,
+        result = _do_reply(sel, loc, args.to, text,
                            nav_room=args.room, nav_query=args.room)
         result["path"] = "cold"
         if result.get("ok"):
@@ -1881,6 +2377,9 @@ def cmd_reply(args, sel, sources):
                 pass
     result["room"] = args.room
     result["duration_ms"] = int((time.time() - t0) * 1000)
+    _attach_profile_result(result, profiled)
+    if result.get("ok"):
+        _maybe_add_followup_from_send(args, result)
     return result
 
 
@@ -2389,11 +2888,15 @@ def _do_send_sticker(sel: dict, loc: dict, package_idx: int, sticker_idx: int) -
     )
 
     try:
+        try:
+            _focus_chrome_tab(loc)
+        except SkillError:
+            pass
         before_info = {}
         for i in range(6):
             if i:
                 time.sleep(0.04)
-            before_info = _json_get(exec_js(js_count_and_open_point, loc, timeout=5, focus=True))
+            before_info = _json_get(exec_js(js_count_and_open_point, loc, timeout=5))
             if before_info.get("ok") or before_info.get("reason") not in {
                 "no_editor", "no_sticker_button", "sticker_button_not_visible"
             }:
@@ -2526,6 +3029,9 @@ def cmd_send_sticker(args, sel, sources):
     if package_idx < 0 or sticker_idx < 0:
         return {"ok": False, "stage": "validate", "reason": "negative_index",
                 "package": package_idx, "sticker": sticker_idx}
+    allowed_failure = _allowed_room_failure(args.to, "send-sticker")
+    if allowed_failure:
+        return allowed_failure
     loc = _require_tab()
     t0 = time.time()
 
@@ -2562,31 +3068,73 @@ def cmd_send_sticker(args, sel, sources):
     return result
 
 
+def _read_current_history(sel: dict, loc: dict, limit: int, room: str | None = None,
+                          path: str = "hot", started_at: float | None = None) -> dict:
+    started_at = started_at or time.time()
+    raw = exec_js(js_history(sel, limit), loc)
+    data = json.loads(raw)
+    header = data.get("header") or ""
+    return {
+        "room": room or header,
+        "matched": header or room,
+        "path": path,
+        "duration_ms": int((time.time() - started_at) * 1000),
+        **data,
+    }
+
+
 def cmd_history(args, sel, sources):
     if not args.room:
         raise SkillError("--room is required")
     loc = _require_tab()
+    t0 = time.time()
+    fast = bool(getattr(args, "fast", False))
+    url = loc.get("url") or ""
+
+    current = None
+    on_chat_list = "#/chats" in url and "#/chats/" not in url
+    if not (fast and on_chat_list):
+        current = _read_current_history(sel, loc, args.limit, room=args.room, path="hot", started_at=t0)
+        if _room_matches(args.room, current.get("header", "")):
+            return current
+    if fast:
+        nav = _open_visible_room_fast(sel, loc, args.room)
+        if not nav.get("ok"):
+            return {
+                "opened": False,
+                "reason": nav,
+                "path": "fast-no-navigate",
+                "duration_ms": int((time.time() - t0) * 1000),
+            }
+        time.sleep(0.08)
+        out = _read_current_history(sel, loc, args.limit, room=args.room,
+                                    path="cold-fast", started_at=t0)
+        if not _room_matches(args.room, out.get("header", "")):
+            return {
+                "opened": False,
+                "reason": "wrong_room_after_fast_open",
+                "requested": args.room,
+                "header": out.get("header", ""),
+                "path": "cold-fast",
+                "duration_ms": int((time.time() - t0) * 1000),
+            }
+        return out
+
     nav = _navigate_to_room(sel, loc, args.room)
     if not nav.get("ok"):
-        return {"opened": False, "reason": nav}
-    # Poll for messages to lazy-load (max ~1s)
-    bubble_sel = json.dumps(sel.get("message_bubble"), ensure_ascii=False)
-    poll_js = f"return document.querySelectorAll({bubble_sel}).length;"
-    bubble_count = 0
-    for _ in range(20):
-        try:
-            n = int(exec_js(poll_js, loc, timeout=5))
-            if n > bubble_count:
-                bubble_count = n
-                # Saw bubbles — short additional wait for any tail to load, then read
-                time.sleep(0.15)
-                break
-        except Exception:
-            pass
-        time.sleep(0.05)
-    raw = exec_js(js_history(sel, args.limit), loc)
-    out = {"room": args.room, "matched": nav.get("matched"), **json.loads(raw)}
-    # Clear search so chat list is back to normal
+        return {"opened": False, "reason": nav,
+                "duration_ms": int((time.time() - t0) * 1000)}
+    time.sleep(0.08)
+    out = _read_current_history(sel, loc, args.limit, room=args.room, path="cold", started_at=t0)
+    out["matched"] = nav.get("matched") or out.get("matched")
+    if not _room_matches(args.room, out.get("header", "")):
+        return {
+            "opened": False,
+            "reason": "wrong_room_after_open",
+            "requested": args.room,
+            "header": out.get("header", ""),
+            "duration_ms": int((time.time() - t0) * 1000),
+        }
     try:
         exec_js(js_set_search(sel, ""), loc, timeout=5)
     except Exception:
@@ -2685,6 +3233,340 @@ def cmd_sticker_tags(args, sel, sources):
     raise SkillError(f"unknown sticker-tags action '{args.action}'")
 
 
+def cmd_allowed_rooms(args, sel, sources):
+    doc = _load_allowed_rooms_doc()
+    action = args.action
+    if action == "show":
+        return {"path": str(USER_ALLOWED_ROOMS_PATH), "enabled": bool(doc.get("enabled")),
+                "rooms": doc.get("rooms", [])}
+    if action == "enable":
+        doc["enabled"] = True
+        _write_allowed_rooms_doc(doc)
+        return {"ok": True, "updated": str(USER_ALLOWED_ROOMS_PATH),
+                "enabled": True, "rooms": doc.get("rooms", [])}
+    if action == "disable":
+        doc["enabled"] = False
+        _write_allowed_rooms_doc(doc)
+        return {"ok": True, "updated": str(USER_ALLOWED_ROOMS_PATH),
+                "enabled": False, "rooms": doc.get("rooms", [])}
+
+    room = (getattr(args, "room", None) or "").strip()
+    if not room:
+        raise SkillError("`allowed-rooms add/remove` requires ROOM")
+    rooms = [str(r) for r in doc.get("rooms", [])]
+    if action == "add":
+        if _normalize_room_name(room) not in {_normalize_room_name(r) for r in rooms}:
+            rooms.append(room)
+        doc["rooms"] = rooms
+        _write_allowed_rooms_doc(doc)
+        return {"ok": True, "updated": str(USER_ALLOWED_ROOMS_PATH),
+                "enabled": bool(doc.get("enabled")), "rooms": rooms}
+    if action == "remove":
+        kept = [r for r in rooms if _normalize_room_name(r) != _normalize_room_name(room)]
+        doc["rooms"] = kept
+        _write_allowed_rooms_doc(doc)
+        return {"ok": True, "updated": str(USER_ALLOWED_ROOMS_PATH),
+                "enabled": bool(doc.get("enabled")), "rooms": kept,
+                "removed": len(rooms) - len(kept)}
+    raise SkillError(f"unknown allowed-rooms action '{action}'")
+
+
+def cmd_tone_profiles(args, sel, sources):
+    doc = _load_tone_profiles_doc()
+    profiles = doc.setdefault("profiles", {})
+    rooms = doc.setdefault("rooms", {})
+    action = args.action
+    if action == "show":
+        return {"path": str(USER_TONE_PROFILES_PATH), "profiles": profiles, "rooms": rooms}
+    if action == "set":
+        name = (args.name or "").strip()
+        if not name:
+            raise SkillError("`tone-profiles set` requires PROFILE")
+        entry = dict(profiles.get(name, {}))
+        if args.prefix is not None:
+            entry["prefix"] = args.prefix
+        else:
+            entry.setdefault("prefix", "")
+        if args.suffix is not None:
+            entry["suffix"] = args.suffix
+        else:
+            entry.setdefault("suffix", "")
+        if args.label:
+            entry["label"] = args.label
+        profiles[name] = entry
+        _write_tone_profiles_doc(doc)
+        return {"ok": True, "updated": str(USER_TONE_PROFILES_PATH), "profile": name, **entry}
+    if action == "remove":
+        name = (args.name or "").strip()
+        if not name:
+            raise SkillError("`tone-profiles remove` requires PROFILE")
+        removed = profiles.pop(name, None)
+        for room, profile in list(rooms.items()):
+            if profile == name:
+                rooms.pop(room, None)
+        _write_tone_profiles_doc(doc)
+        return {"ok": removed is not None, "updated": str(USER_TONE_PROFILES_PATH),
+                "removed_profile": name, "removed": removed}
+    if action == "assign":
+        room = (args.name or "").strip()
+        profile_name = (args.profile or "").strip()
+        if not room or not profile_name:
+            raise SkillError("`tone-profiles assign` requires ROOM --profile PROFILE")
+        if profile_name not in profiles:
+            raise SkillError(f"tone profile '{profile_name}' is not defined")
+        rooms[room] = profile_name
+        _write_tone_profiles_doc(doc)
+        return {"ok": True, "updated": str(USER_TONE_PROFILES_PATH),
+                "room": room, "profile": profile_name}
+    if action == "unassign":
+        room = (args.name or "").strip()
+        if not room:
+            raise SkillError("`tone-profiles unassign` requires ROOM")
+        removed = rooms.pop(room, None)
+        _write_tone_profiles_doc(doc)
+        return {"ok": removed is not None, "updated": str(USER_TONE_PROFILES_PATH),
+                "room": room, "removed_profile": removed}
+    if action == "preview":
+        room = (args.room or args.name or "").strip()
+        if not room or args.text is None:
+            raise SkillError("`tone-profiles preview` requires --room and --text")
+        profiled = _profile_message_text(room, args.text, args.profile, False)
+        return {"room": room, **profiled}
+    raise SkillError(f"unknown tone-profiles action '{action}'")
+
+
+def cmd_follow_ups(args, sel, sources):
+    doc = _load_followups_doc()
+    items = doc.setdefault("items", [])
+    action = args.action
+    if action == "add":
+        if not args.room or not args.text:
+            raise SkillError("`follow-ups add` requires --room and --text")
+        due_at = _due_at_from_args(args.at, getattr(args, "in_", None))
+        item = _add_followup(args.room, args.text, due_at, source="manual")
+        return {"ok": True, "path": str(USER_FOLLOW_UPS_PATH), "item": item}
+    if action == "list":
+        out = items if args.all else [i for i in items if i.get("status", "open") == "open"]
+        return {"path": str(USER_FOLLOW_UPS_PATH), "count": len(out), "items": out}
+    if action == "due":
+        now = _now()
+        due = [
+            _with_overdue(i, now)
+            for i in items
+            if i.get("status", "open") == "open" and _is_due(str(i.get("due_at", "")), now)
+        ]
+        return {"path": str(USER_FOLLOW_UPS_PATH), "due_count": len(due), "items": due}
+    if action in ("done", "remove"):
+        item_id = (args.item_id or "").strip()
+        if not item_id:
+            raise SkillError(f"`follow-ups {action}` requires ID")
+        for i, item in enumerate(items):
+            if item.get("id") != item_id:
+                continue
+            if action == "remove":
+                removed = items.pop(i)
+                _write_followups_doc(doc)
+                return {"ok": True, "path": str(USER_FOLLOW_UPS_PATH), "removed": removed}
+            item["status"] = "done"
+            item["completed_at"] = _format_dt(_now())
+            _write_followups_doc(doc)
+            return {"ok": True, "path": str(USER_FOLLOW_UPS_PATH), "item": item}
+        return {"ok": False, "reason": "follow_up_not_found", "id": item_id}
+    raise SkillError(f"unknown follow-ups action '{action}'")
+
+
+def cmd_schedule(args, sel, sources):
+    doc = _load_schedule_doc()
+    items = doc.setdefault("items", [])
+    action = args.action
+    if action == "add":
+        if not args.to:
+            raise SkillError("`schedule add` requires --to")
+        allowed_failure = _allowed_room_failure(args.to, "schedule")
+        if allowed_failure:
+            return allowed_failure
+        at_value = _due_at_from_args(args.at, getattr(args, "in_", None))
+        has_sticker = bool(args.meaning) or args.package is not None or args.sticker is not None
+        if bool(args.text) == has_sticker:
+            raise SkillError("`schedule add` requires exactly one of --text or sticker options")
+        item = {
+            "id": _next_config_id(doc, "sch"),
+            "to": args.to,
+            "at": at_value,
+            "repeat": args.repeat,
+            "status": "pending",
+            "created_at": _format_dt(_now()),
+        }
+        if args.text:
+            item.update({"kind": "text", "text": args.text})
+            if args.profile:
+                item["profile"] = args.profile
+            if args.no_profile:
+                item["no_profile"] = True
+        else:
+            if args.meaning and (args.package is not None or args.sticker is not None):
+                raise SkillError("scheduled sticker --meaning cannot be combined with --package/--sticker")
+            package_idx = None if args.meaning else (0 if args.package is None else args.package)
+            sticker_idx = None if args.meaning else (0 if args.sticker is None else args.sticker)
+            if package_idx is not None and (package_idx < 0 or sticker_idx < 0):
+                raise SkillError("sticker package/sticker indexes must be non-negative")
+            item.update({"kind": "sticker"})
+            if args.meaning:
+                item["meaning"] = args.meaning
+            else:
+                item["package"] = package_idx
+                item["sticker"] = sticker_idx
+        items.append(item)
+        _write_schedule_doc(doc)
+        return {"ok": True, "path": str(USER_SCHEDULE_PATH), "item": item}
+
+    if action == "list":
+        out = items if args.all else [i for i in items if i.get("status", "pending") == "pending"]
+        return {"path": str(USER_SCHEDULE_PATH), "count": len(out), "items": out}
+
+    if action == "remove":
+        item_id = (args.item_id or "").strip()
+        if not item_id:
+            raise SkillError("`schedule remove` requires ID")
+        for i, item in enumerate(items):
+            if item.get("id") == item_id:
+                removed = items.pop(i)
+                _write_schedule_doc(doc)
+                return {"ok": True, "path": str(USER_SCHEDULE_PATH), "removed": removed}
+        return {"ok": False, "reason": "scheduled_send_not_found", "id": item_id}
+
+    if action == "run":
+        now = _now()
+        due = [
+            item for item in items
+            if item.get("status", "pending") == "pending" and _is_due(str(item.get("at", "")), now)
+        ]
+        if args.dry_run:
+            return {"path": str(USER_SCHEDULE_PATH), "dry_run": True,
+                    "due_count": len(due), "items": [_with_overdue(i, now) for i in due]}
+        results = []
+        for item in due:
+            if item.get("kind") == "sticker":
+                send_args = argparse.Namespace(
+                    to=item.get("to"),
+                    meaning=item.get("meaning"),
+                    package=item.get("package"),
+                    sticker=item.get("sticker"),
+                )
+                result = cmd_send_sticker(send_args, sel, sources)
+            else:
+                send_args = argparse.Namespace(
+                    to=item.get("to"),
+                    text=item.get("text"),
+                    profile=item.get("profile"),
+                    no_profile=bool(item.get("no_profile")),
+                    follow_up_at=None,
+                    follow_up_in=None,
+                    follow_up_note=None,
+                )
+                result = cmd_send(send_args, sel, sources)
+            item["last_result"] = result
+            if result.get("ok"):
+                item["last_sent_at"] = _format_dt(now)
+                if item.get("repeat", "none") == "none":
+                    item["status"] = "sent"
+                    item["sent_at"] = _format_dt(now)
+                else:
+                    item["at"] = _next_repeated_at(str(item.get("at")), str(item.get("repeat")))
+            else:
+                item["last_error_at"] = _format_dt(now)
+            results.append({"id": item.get("id"), "ok": bool(result.get("ok")),
+                            "result": result, "next_at": item.get("at"),
+                            "status": item.get("status")})
+        _write_schedule_doc(doc)
+        return {"path": str(USER_SCHEDULE_PATH), "ran": len(results), "results": results}
+
+    raise SkillError(f"unknown schedule action '{action}'")
+
+
+def cmd_brief(args, sel, sources):
+    t0 = time.time()
+    deadline = t0 + (max(100, int(getattr(args, "max_runtime_ms", 900))) / 1000.0)
+    rooms = _room_args(args)
+    current_history = None
+    if not rooms:
+        loc = _require_tab()
+        current_history = _read_current_history(sel, loc, args.limit, path="current", started_at=t0)
+        if current_history.get("header"):
+            rooms = [current_history.get("header")]
+        else:
+            rooms = _default_visible_rooms(sel, args.limit_rooms)
+    results = []
+    total_needs_reply = 0
+    for room in rooms:
+        if time.time() >= deadline:
+            results.append({"room": room, "ok": False, "reason": "deadline_exceeded"})
+            continue
+        if current_history and _room_matches(room, current_history.get("header", "")):
+            history = current_history
+        else:
+            h_args = argparse.Namespace(room=room, limit=args.limit, fast=True)
+            history = cmd_history(h_args, sel, sources)
+        messages = history.get("messages", [])
+        if not messages and history.get("opened") is False:
+            results.append({"room": room, "ok": False, "reason": history.get("reason")})
+            continue
+        brief = _brief_from_messages(room, messages, args.preview)
+        if args.include_messages:
+            brief["messages"] = messages
+        total_needs_reply += brief.get("needs_reply_count", 0)
+        results.append({"ok": True, **brief})
+    return {
+        "rooms": rooms,
+        "room_count": len(rooms),
+        "total_needs_reply": total_needs_reply,
+        "partial": any(not item.get("ok") for item in results),
+        "duration_ms": int((time.time() - t0) * 1000),
+        "items": results,
+    }
+
+
+def cmd_needs_reply(args, sel, sources):
+    t0 = time.time()
+    deadline = t0 + (max(100, int(getattr(args, "max_runtime_ms", 900))) / 1000.0)
+    rooms = _room_args(args)
+    current_history = None
+    if not rooms:
+        loc = _require_tab()
+        current_history = _read_current_history(sel, loc, args.limit, path="current", started_at=t0)
+        if current_history.get("header"):
+            rooms = [current_history.get("header")]
+        else:
+            rooms = _default_visible_rooms(sel, args.limit_rooms)
+    candidates = []
+    room_results = []
+    for room in rooms:
+        if time.time() >= deadline:
+            room_results.append({"room": room, "ok": False, "reason": "deadline_exceeded"})
+            continue
+        if current_history and _room_matches(room, current_history.get("header", "")):
+            history = current_history
+        else:
+            h_args = argparse.Namespace(room=room, limit=args.limit, fast=True)
+            history = cmd_history(h_args, sel, sources)
+        messages = history.get("messages", [])
+        if not messages and history.get("opened") is False:
+            room_results.append({"room": room, "ok": False, "reason": history.get("reason")})
+            continue
+        room_candidates = _find_needs_reply(messages, args.include_before_last_sent)
+        for item in room_candidates:
+            item["room"] = room
+        candidates.extend(room_candidates)
+        room_results.append({"room": room, "ok": True, "candidate_count": len(room_candidates)})
+    return {
+        "rooms": room_results,
+        "candidate_count": len(candidates),
+        "partial": any(not item.get("ok") for item in room_results),
+        "duration_ms": int((time.time() - t0) * 1000),
+        "candidates": candidates,
+    }
+
+
 def cmd_cache_info(args, sel, sources):
     profile = args.profile or "Default"
     template = _load_json(DEFAULT_SEL_PATH).get("leveldb_path_template", "")
@@ -2751,6 +3633,13 @@ def main():
     sd = sub.add_parser("send")
     sd.add_argument("--to", required=True)
     sd.add_argument("--text", required=True)
+    sd.add_argument("--profile", help="Tone profile to apply before sending.")
+    sd.add_argument("--no-profile", action="store_true",
+                    help="Do not apply an assigned room tone profile.")
+    sd.add_argument("--follow-up-at", help="Create a follow-up reminder after a successful send.")
+    sd.add_argument("--follow-up-in", dest="follow_up_in",
+                    help="Create a follow-up reminder after a duration like 30m, 2h, 1d.")
+    sd.add_argument("--follow-up-note", help="Reminder text for --follow-up-at/--follow-up-in.")
 
     lg = sub.add_parser("leave-group")
     lg.add_argument("--room", required=True)
@@ -2762,6 +3651,13 @@ def main():
     rp.add_argument("--to", required=True,
                     help="Substring of the message being replied to.")
     rp.add_argument("--text", required=True, help="The reply body.")
+    rp.add_argument("--profile", help="Tone profile to apply before sending.")
+    rp.add_argument("--no-profile", action="store_true",
+                    help="Do not apply an assigned room tone profile.")
+    rp.add_argument("--follow-up-at", help="Create a follow-up reminder after a successful reply.")
+    rp.add_argument("--follow-up-in", dest="follow_up_in",
+                    help="Create a follow-up reminder after a duration like 30m, 2h, 1d.")
+    rp.add_argument("--follow-up-note", help="Reminder text for --follow-up-at/--follow-up-in.")
 
     ss = sub.add_parser("send-sticker")
     ss.add_argument("--to", required=True, help="Room to send the sticker to.")
@@ -2781,6 +3677,36 @@ def main():
     sr.add_argument("--query", required=True)
     sr.add_argument("--limit", type=int, default=200)
 
+    br = sub.add_parser("brief", aliases=["daily-brief"])
+    br.set_defaults(cmd="brief")
+    br.add_argument("--room", action="append", default=[],
+                    help="Room to include. Repeatable.")
+    br.add_argument("--rooms", help="Comma-separated room names.")
+    br.add_argument("--limit-rooms", type=int, default=10,
+                    help="When no room is provided, brief this many visible rooms.")
+    br.add_argument("--limit", type=int, default=40,
+                    help="Messages to read per room.")
+    br.add_argument("--max-runtime-ms", type=int, default=900,
+                    help="Soft runtime budget for fast brief scans (default 900).")
+    br.add_argument("--preview", type=int, default=5,
+                    help="Recent messages to include per room.")
+    br.add_argument("--include-messages", action="store_true",
+                    help="Include the full fetched message list.")
+
+    nr = sub.add_parser("needs-reply", aliases=["inbox"])
+    nr.set_defaults(cmd="needs-reply")
+    nr.add_argument("--room", action="append", default=[],
+                    help="Room to scan. Repeatable.")
+    nr.add_argument("--rooms", help="Comma-separated room names.")
+    nr.add_argument("--limit-rooms", type=int, default=10,
+                    help="When no room is provided, scan this many visible rooms.")
+    nr.add_argument("--limit", type=int, default=80,
+                    help="Messages to read per room.")
+    nr.add_argument("--max-runtime-ms", type=int, default=900,
+                    help="Soft runtime budget for fast inbox scans (default 900).")
+    nr.add_argument("--include-before-last-sent", action="store_true",
+                    help="Include older requests even if you have sent a later message.")
+
     w = sub.add_parser("watch")
     w.add_argument("--interval", type=int, default=5)
     w.add_argument("--include-initial", action="store_true")
@@ -2797,6 +3723,49 @@ def main():
     st.add_argument("--package", type=int)
     st.add_argument("--sticker", type=int)
     st.add_argument("--label")
+
+    tp = sub.add_parser("tone-profiles", aliases=["tone-profile"])
+    tp.set_defaults(cmd="tone-profiles")
+    tp.add_argument("action", choices=["show", "set", "remove", "assign", "unassign", "preview"])
+    tp.add_argument("name", nargs="?")
+    tp.add_argument("--profile")
+    tp.add_argument("--prefix")
+    tp.add_argument("--suffix")
+    tp.add_argument("--label")
+    tp.add_argument("--room")
+    tp.add_argument("--text")
+
+    fu = sub.add_parser("follow-ups", aliases=["follow-up"])
+    fu.set_defaults(cmd="follow-ups")
+    fu.add_argument("action", choices=["add", "list", "due", "done", "remove"])
+    fu.add_argument("item_id", nargs="?")
+    fu.add_argument("--room")
+    fu.add_argument("--text")
+    fu.add_argument("--at")
+    fu.add_argument("--in", dest="in_")
+    fu.add_argument("--all", action="store_true")
+
+    sc = sub.add_parser("schedule", aliases=["scheduled-sends"])
+    sc.set_defaults(cmd="schedule")
+    sc.add_argument("action", choices=["add", "list", "remove", "run"])
+    sc.add_argument("item_id", nargs="?")
+    sc.add_argument("--to")
+    sc.add_argument("--text")
+    sc.add_argument("--at")
+    sc.add_argument("--in", dest="in_")
+    sc.add_argument("--repeat", choices=["none", "daily", "weekdays"], default="none")
+    sc.add_argument("--profile")
+    sc.add_argument("--no-profile", action="store_true")
+    sc.add_argument("--meaning", "--tag", dest="meaning")
+    sc.add_argument("--package", type=int)
+    sc.add_argument("--sticker", type=int)
+    sc.add_argument("--all", action="store_true")
+    sc.add_argument("--dry-run", action="store_true")
+
+    ar = sub.add_parser("allowed-rooms", aliases=["allowed-room"])
+    ar.set_defaults(cmd="allowed-rooms")
+    ar.add_argument("action", choices=["show", "enable", "disable", "add", "remove"])
+    ar.add_argument("room", nargs="?")
 
     ci = sub.add_parser("cache-info"); ci.add_argument("--profile")
     cd = sub.add_parser("cache-dump")
@@ -2815,6 +3784,12 @@ def main():
         "watch": cmd_watch,
         "selectors": cmd_selectors,
         "sticker-tags": cmd_sticker_tags,
+        "brief": cmd_brief,
+        "needs-reply": cmd_needs_reply,
+        "tone-profiles": cmd_tone_profiles,
+        "follow-ups": cmd_follow_ups,
+        "schedule": cmd_schedule,
+        "allowed-rooms": cmd_allowed_rooms,
         "cache-info": cmd_cache_info, "cache-dump": cmd_cache_dump,
     }
     try:

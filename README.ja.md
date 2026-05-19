@@ -109,6 +109,15 @@ python3 cli.py reply --room "Family" --to "6時に会おう" --text "了解"
 python3 cli.py send-sticker --to "Family"   # 下記「ステッカー」参照
 python3 cli.py send-sticker --to "Family" --meaning thanks
 python3 cli.py sticker-tags set thanks --package 0 --sticker 3 --label "ありがとう"
+python3 cli.py brief --room "Family" --room "Team"
+python3 cli.py needs-reply --room "Team"
+python3 cli.py tone-profiles set polite --prefix "こんにちは。 " --suffix " ありがとうございます。"
+python3 cli.py tone-profiles assign "Team" --profile polite
+python3 cli.py follow-ups add --room "Team" --text "返信を確認" --in 2h
+python3 cli.py schedule add --to "Team" --text "スタンドアップの時間です" --at "2030-01-02 09:00"
+python3 cli.py schedule run --dry-run
+python3 cli.py allowed-rooms add "나만의 그룹"
+python3 cli.py allowed-rooms enable
 python3 cli.py leave-group --room "Old Group" --confirm   # 取り消し不可 — 下記参照
 python3 cli.py watch --interval 5         # 新着メッセージをポーリング (Ctrl-C で停止)
 
@@ -141,6 +150,65 @@ Events 経由で `表示 → デベロッパー → Apple Events からの JavaS
 
 注: Chrome はこの設定を AppleScript で**オフにする**ことをブロックします —— オンに
 する方向のみ自動化可能で、このコマンドにはそれで十分です。
+
+## 毎日の自動化
+
+`brief` は最近のメッセージを読み、件数、最近のプレビュー、質問/依頼の数、返信が
+必要そうな項目、そして `summary.text` の会話要約を JSON で返します。ルームを指定しない
+場合は、現在開いているルームを一度だけ読む高速経路を使います。複数ルームも指定できますが、
+既定の `--max-runtime-ms 900` を超えた残りのルームは `deadline_exceeded` として扱います。
+
+```sh
+python3 cli.py brief --room "Family" --room "Team" --limit 50
+python3 cli.py daily-brief --rooms "Family,Team" --preview 3 --max-runtime-ms 1500
+```
+
+`needs-reply` は、各ルームで自分の最後の送信以降に届いた質問/依頼らしいメッセージを
+抽出します。ルームを指定しない場合は現在開いているルームを高速に読み、
+`--max-runtime-ms` で複数ルームスキャンの時間予算を調整できます。
+
+```sh
+python3 cli.py needs-reply --room "Team"
+python3 cli.py inbox --rooms "Family,Team" --include-before-last-sent
+```
+
+`tone-profiles` は手動のルーム別トーン設定です。現時点では LLM で文体を書き換えず、
+ユーザーが指定した prefix/suffix を適用します。
+
+```sh
+python3 cli.py tone-profiles set polite --prefix "こんにちは。 " --suffix " ありがとうございます。"
+python3 cli.py tone-profiles assign "Team" --profile polite
+python3 cli.py send --to "Team" --text "確認しました"   # プロファイルを自動適用
+python3 cli.py send --to "Team" --text "確認しました" --no-profile
+```
+
+`follow-ups` はローカルのリマインダーです。`send` / `reply` に `--follow-up-in` または
+`--follow-up-at` を付けると、送信成功後に自動で作成されます。
+
+```sh
+python3 cli.py follow-ups add --room "Team" --text "返信を確認" --in 2h
+python3 cli.py follow-ups due
+python3 cli.py send --to "Team" --text "確認お願いします" --follow-up-in 1d
+```
+
+`schedule` は予約送信キューです。バックグラウンドデーモンは起動しないため、実際の送信は
+`schedule run` を `cron` や `launchd` から定期実行してください。
+
+```sh
+python3 cli.py schedule add --to "Team" --text "スタンドアップの時間です" --at "2030-01-02 09:00"
+python3 cli.py schedule add --to "Team" --text "今日のブロッカーを共有してください" --in 10m
+python3 cli.py schedule run
+```
+
+`allowed-rooms` は送信の安全装置です。有効にすると `send`, `reply`, `send-sticker`,
+`leave-group`, `schedule add/run` は、許可リスト外のルームに対して Chrome に触れる前に
+失敗します。
+
+```sh
+python3 cli.py allowed-rooms add "나만의 그룹"
+python3 cli.py allowed-rooms enable
+python3 cli.py allowed-rooms show
+```
 
 ### `reply`
 

@@ -109,6 +109,15 @@ python3 cli.py reply --room "Family" --to "see you at 6" --text "got it"
 python3 cli.py send-sticker --to "Family"   # see "Stickers" below
 python3 cli.py send-sticker --to "Family" --meaning thanks
 python3 cli.py sticker-tags set thanks --package 0 --sticker 3 --label "thank you"
+python3 cli.py brief --room "Family" --room "Team"
+python3 cli.py needs-reply --room "Team"
+python3 cli.py tone-profiles set polite --prefix "Hi, " --suffix " Thanks."
+python3 cli.py tone-profiles assign "Team" --profile polite
+python3 cli.py follow-ups add --room "Team" --text "check for a reply" --in 2h
+python3 cli.py schedule add --to "Team" --text "Standup time" --at "2030-01-02 09:00"
+python3 cli.py schedule run --dry-run
+python3 cli.py allowed-rooms add "나만의 그룹"
+python3 cli.py allowed-rooms enable
 python3 cli.py leave-group --room "Old Group" --confirm   # irreversible — see below
 python3 cli.py watch --interval 5         # poll for new messages (Ctrl-C to stop)
 
@@ -141,6 +150,67 @@ accidentally toggles it back off.
 
 Note: Chrome blocks turning this setting **off** via AppleScript — only the on
 direction is automatable, which is all this command needs.
+
+## Daily automation
+
+`brief` scans recent messages and returns structured JSON: message counts, recent
+previews, question/request counts, likely reply-needed items, and a conversation
+summary in `summary.text`. With no room provided it uses a fast path that reads
+the currently open room once. Multiple rooms are supported; the default
+`--max-runtime-ms 900` budget marks remaining rooms as `deadline_exceeded`
+instead of hanging.
+
+```sh
+python3 cli.py brief --room "Family" --room "Team" --limit 50
+python3 cli.py daily-brief --rooms "Family,Team" --preview 3 --max-runtime-ms 1500
+```
+
+`needs-reply` finds received question/request-like messages after your latest sent
+message in each room. With no room provided it reads the currently open room, and
+`--max-runtime-ms` controls the scan budget for multiple rooms.
+
+```sh
+python3 cli.py needs-reply --room "Team"
+python3 cli.py inbox --rooms "Family,Team" --include-before-last-sent
+```
+
+`tone-profiles` stores manual room tone profiles. The current implementation does
+not rewrite with an LLM; it applies user-defined prefixes and suffixes.
+
+```sh
+python3 cli.py tone-profiles set polite --prefix "Hi, " --suffix " Thanks."
+python3 cli.py tone-profiles assign "Team" --profile polite
+python3 cli.py send --to "Team" --text "confirmed"   # profile auto-applies
+python3 cli.py send --to "Team" --text "confirmed" --no-profile
+```
+
+`follow-ups` is a local reminder list. `send` and `reply` can also create a
+follow-up after successful delivery.
+
+```sh
+python3 cli.py follow-ups add --room "Team" --text "check for a reply" --in 2h
+python3 cli.py follow-ups due
+python3 cli.py send --to "Team" --text "please confirm" --follow-up-in 1d
+```
+
+`schedule` is a scheduled-send queue. It does not run a background daemon; execute
+`schedule run` from `cron` or `launchd` to send due items.
+
+```sh
+python3 cli.py schedule add --to "Team" --text "Standup time" --at "2030-01-02 09:00"
+python3 cli.py schedule add --to "Team" --text "Share today's blockers" --in 10m
+python3 cli.py schedule run
+```
+
+`allowed-rooms` is the outbound safety rail. When enabled, `send`, `reply`,
+`send-sticker`, `leave-group`, and `schedule add/run` fail before touching Chrome
+if the target room is not explicitly allowed.
+
+```sh
+python3 cli.py allowed-rooms add "나만의 그룹"
+python3 cli.py allowed-rooms enable
+python3 cli.py allowed-rooms show
+```
 
 ### `reply`
 
