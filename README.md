@@ -1,11 +1,15 @@
-# line-chrome-cli
+# line-chrome-skill
 
 **English** | [한국어](README.ko.md) | [日本語](README.ja.md)
 
-Drive the **official LINE Chrome extension** from the command line — or let an AI
-assistant do it for you. Send messages, catch up on conversations, summarize, search,
-and watch for replies, all by injecting JavaScript through AppleScript's
-`execute javascript` bridge.
+Use LINE from Claude Code, Codex, or another local agent through a **`/line-chrome`
+skill**. You ask in natural language, such as "tell Alex I'll be 5 minutes late",
+"brief my chat with Alex", or "send this in 3 minutes"; the agent reads the bundled
+`SKILL.md` and runs `cli.py` against the official LINE Chrome extension.
+
+`cli.py` is the execution engine for the skill. You can run it directly from a
+terminal, but the primary user experience is an agent discovering `/line-chrome`
+and invoking the right local command for you.
 
 It does **not** touch the LINE desktop app, harvest tokens, or reverse-engineer LINE's
 private API. Every outbound message is produced by your own logged-in LINE extension,
@@ -15,10 +19,10 @@ exactly as if you typed it in the UI.
 
 <!-- Optional: drop a demo screenshot or GIF here, e.g. ![demo](docs/demo.gif) -->
 
-## What you can do
+## What Agents Can Do
 
-Install it as a [Claude Code](https://claude.com/claude-code) skill (or wire it into
-any agent or shell script), and then just ask in plain language:
+Install it as a skill for Claude Code, Codex, or any agent that reads `SKILL.md`,
+then invoke `/line-chrome` or ask in plain language:
 
 | You say | What happens |
 | --- | --- |
@@ -27,6 +31,8 @@ any agent or shell script), and then just ask in plain language:
 | "Summarize today's conversation in the Family group" | Pulls history and summarizes it |
 | "Find the address Alex sent me yesterday" | Searches a room's messages for a keyword |
 | "Tell me when someone replies in the project room" | Watches for new incoming messages |
+| "Send Alex 'what are you doing?' in 3 minutes" | Adds a scheduled send and runs it when due |
+| "What tone fits my chat with Alex?" | Reads the conversation and suggests a tone profile |
 
 ### Meaningful scenarios
 
@@ -38,8 +44,9 @@ any agent or shell script), and then just ask in plain language:
   reminder to a room.
 - **Archiving** — dump a room's history to a file for your own records.
 
-Every one of these maps to a plain CLI subcommand (`send`, `history`, `search`,
-`watch`, …), so it works just as well inside shell scripts with no agent involved.
+Every request maps to a plain CLI subcommand (`send`, `brief`, `history`, `search`,
+`schedule`, ...). The CLI is therefore the stable local execution layer that the
+skill calls, not the only intended user interface.
 
 ## How it works
 
@@ -76,23 +83,69 @@ externalized in `selectors.json` so a LINE update can be repaired without code c
 
 No dependencies beyond Python 3.9+ and `osascript` (preinstalled on macOS).
 
+### 1. Install as an Agent Skill (Recommended)
+
 ```sh
-git clone https://github.com/ewhasan936/line-chrome-cli.git
-cd line-chrome-cli
-python3 cli.py status
+git clone https://github.com/ewhasan936/line-chrome-skill.git
 ```
 
-Optionally put it on your `PATH`:
+Place this repository directory where your agent looks for skills, named
+`line-chrome`. The root `SKILL.md` is the skill manifest/instructions file, so the
+agent can discover `/line-chrome` and learn which CLI commands to run internally.
+
+After installing, ask your agent:
+
+```text
+/line-chrome check status
+/line-chrome brief my chat with Alex
+/line-chrome send Alex "what are you doing?" in 3 minutes
+```
+
+You can also ask naturally if your agent can choose skills automatically:
+
+```text
+Send Alex a LINE message saying I'll be 5 minutes late.
+Find LINE messages that still need my reply.
+```
+
+### 2. Verify the Local Engine Once
+
+The agent will run these under the hood, but it is useful to verify the local
+connection once:
+
+```sh
+cd line-chrome-skill
+python3 cli.py status
+python3 cli.py enable-applescript
+```
+
+### 3. Direct CLI Use (Optional)
+
+If you also want shell access, put it on your `PATH`:
 
 ```sh
 ln -s "$PWD/cli.py" /usr/local/bin/line-chrome
 line-chrome status
 ```
 
-To use it as a Claude Code skill, place this directory where Claude Code looks for
-skills — the bundled `SKILL.md` makes it discoverable.
-
 ## Usage
+
+### Ask the Agent
+
+Most users should interact through the skill:
+
+```text
+/line-chrome brief my chat with Alex
+/line-chrome send Alex "what are you doing?"
+/line-chrome send a sorry sticker to My Group
+/line-chrome find LINE messages that need my reply
+/line-chrome recommend a tone profile for Alex
+```
+
+### Internal CLI Commands
+
+These are the stable commands the skill uses internally. Advanced users can run
+them directly.
 
 ```sh
 python3 cli.py status                    # Chrome attached? selectors loaded?

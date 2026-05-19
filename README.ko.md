@@ -1,10 +1,14 @@
-# line-chrome-cli
+# line-chrome-skill
 
 [English](README.md) | **한국어** | [日本語](README.ja.md)
 
-**공식 LINE Chrome 확장**을 커맨드라인에서 조작하거나, AI 어시스턴트가 대신
-조작하게 합니다. 메시지 보내기, 대화 따라잡기, 요약, 검색, 답장 감시 — 모두
-AppleScript의 `execute javascript` 브리지로 JavaScript를 주입해 처리합니다.
+Claude Code, Codex 같은 에이전트에서 **`/line-chrome` 스킬로 LINE을 조작**하게 하는
+로컬 스킬입니다. 사용자는 "김용진한테 5분 늦는다고 보내줘", "김용진 대화 요약해줘",
+"3분 뒤에 모하누라고 보내줘"처럼 자연어로 요청하고, 에이전트가 이 저장소의
+`SKILL.md`와 `cli.py`를 이용해 실제 LINE Chrome 확장을 조작합니다.
+
+`cli.py`는 스킬의 실행 엔진입니다. 직접 터미널에서 쓸 수도 있지만, 기본 사용 모델은
+에이전트가 `/line-chrome` 스킬을 발견하고 필요한 CLI 명령을 대신 실행하는 방식입니다.
 
 LINE 데스크톱 앱을 건드리거나, 토큰을 빼내거나, LINE의 비공개 API를
 리버스엔지니어링하지 **않습니다**. 모든 발신 메시지는 사용자 본인이 로그인한 LINE
@@ -14,10 +18,10 @@ LINE 데스크톱 앱을 건드리거나, 토큰을 빼내거나, LINE의 비공
 
 <!-- 선택: 데모 스크린샷이나 GIF를 여기에 넣으세요. 예: ![demo](docs/demo.gif) -->
 
-## 무엇을 할 수 있나요
+## 에이전트에서 무엇을 할 수 있나요
 
-[Claude Code](https://claude.com/claude-code) 스킬로 설치하거나(또는 다른 에이전트·셸
-스크립트에 연결하고), 자연어로 요청하면 됩니다:
+Claude Code, Codex, 또는 `SKILL.md`를 읽는 다른 로컬 에이전트에서 `/line-chrome`을
+호출하거나 LINE 작업을 자연어로 요청하면 됩니다:
 
 | 이렇게 말하면 | 이런 일이 일어납니다 |
 | --- | --- |
@@ -26,6 +30,8 @@ LINE 데스크톱 앱을 건드리거나, 토큰을 빼내거나, LINE의 비공
 | "가족 그룹 오늘 대화 요약해줘" | 대화 기록을 가져와 요약 |
 | "어제 용진이가 보낸 주소 찾아줘" | 채팅방 메시지에서 키워드 검색 |
 | "프로젝트방에 누가 답하면 알려줘" | 새 수신 메시지를 감시 |
+| "3분 뒤에 김용진한테 모하누라고 보내줘" | 예약 큐에 넣고 due 시각에 전송 |
+| "김용진 방에는 어떤 tone이 어울려?" | 최근 대화 흐름을 읽고 톤 프로필 추천 |
 
 ### 의미 있는 활용 시나리오
 
@@ -36,8 +42,9 @@ LINE 데스크톱 앱을 건드리거나, 토큰을 빼내거나, LINE의 비공
 - **예약 리마인더** — `cron`과 결합: 평일 오전 9시마다 채팅방에 스탠드업 알림 전송.
 - **아카이빙** — 채팅방 기록을 파일로 덤프해 보관.
 
-이 모든 것은 일반 CLI 서브커맨드(`send`, `history`, `search`, `watch` 등)로
-매핑되므로, 에이전트 없이 셸 스크립트 안에서도 동일하게 동작합니다.
+이 모든 자연어 요청은 내부적으로 일반 CLI 서브커맨드(`send`, `brief`, `history`,
+`search`, `schedule` 등)로 매핑됩니다. 즉 CLI는 사용자가 직접 쓰는 화면이라기보다,
+스킬이 안정적으로 호출하는 로컬 실행 계층입니다.
 
 ## 동작 원리
 
@@ -74,23 +81,69 @@ LINE 확장은 Chrome 탭 안에서 일반 웹페이지로 렌더링됩니다. `
 
 Python 3.9+ 와 `osascript`(macOS 기본 설치) 외에는 의존성이 없습니다.
 
+### 1. 에이전트 스킬로 설치 (권장)
+
 ```sh
-git clone https://github.com/ewhasan936/line-chrome-cli.git
-cd line-chrome-cli
-python3 cli.py status
+git clone https://github.com/ewhasan936/line-chrome-skill.git
 ```
 
-선택적으로 `PATH`에 등록:
+이 저장소 디렉토리를 Claude Code, Codex 등 사용하는 에이전트가 스킬을 찾는 위치에
+`line-chrome` 이름으로 두세요. 루트의 `SKILL.md`가 스킬 메타데이터이므로, 에이전트는
+이 파일을 통해 `/line-chrome` 작업 방법과 내부 CLI 명령을 학습합니다.
+
+설치 후 에이전트에게 이렇게 요청합니다:
+
+```text
+/line-chrome status 확인해줘
+/line-chrome 김용진 대화 brief 해줘
+/line-chrome 3분 뒤에 김용진한테 모하누라고 보내줘
+```
+
+또는 스킬 이름을 직접 쓰지 않아도, 에이전트가 이 스킬을 사용할 수 있다면 자연어로
+요청하면 됩니다:
+
+```text
+LINE에서 김용진한테 뭐하냐고 보내줘
+오늘 팀방에서 내가 답해야 할 메시지 찾아줘
+```
+
+### 2. 초기 연결 확인
+
+에이전트가 내부적으로 실행할 CLI가 정상 동작하는지만 한 번 확인합니다:
+
+```sh
+cd line-chrome-skill
+python3 cli.py status
+python3 cli.py enable-applescript
+```
+
+### 3. 직접 CLI 사용 (선택)
+
+에이전트 없이 셸에서 직접 쓰고 싶다면 `PATH`에 등록할 수 있습니다:
 
 ```sh
 ln -s "$PWD/cli.py" /usr/local/bin/line-chrome
 line-chrome status
 ```
 
-Claude Code 스킬로 쓰려면 이 디렉토리를 Claude Code가 스킬을 찾는 위치에 두세요 —
-포함된 `SKILL.md`가 자동 발견되게 해줍니다.
-
 ## 사용법
+
+### 에이전트에게 요청하기
+
+일반 사용자는 보통 아래처럼 자연어로 요청합니다:
+
+```text
+/line-chrome 김용진 대화 요약해줘
+/line-chrome 김용진한테 "모하누" 보내줘
+/line-chrome 나만의 그룹에 미안해 스티커 보내줘
+/line-chrome 내 LINE 받은편지함에서 답장 필요한 것 찾아줘
+/line-chrome 김용진 방 tone profile 추천해줘
+```
+
+### 내부 CLI 명령
+
+아래 명령들은 에이전트가 스킬 실행 중 내부적으로 호출하는 안정적인 인터페이스입니다.
+고급 사용자는 직접 실행할 수도 있습니다.
 
 ```sh
 python3 cli.py status                    # Chrome 연결됨? selector 로드됨?

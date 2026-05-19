@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test suite for the `reply` and `send-sticker` commands of line-chrome-cli.
+"""Test suite for the `reply` and `send-sticker` commands of line-chrome-skill.
 
 Every test sends only into a single test room — set it with the LINE_TEST_ROOM
 env var (use a personal/self group so test traffic bothers nobody):
