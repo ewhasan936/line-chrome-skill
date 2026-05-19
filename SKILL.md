@@ -60,6 +60,21 @@ cold path (navigation folded in) ~0.8s — both under 1s.
 
 `send-sticker --to R [--package N] [--sticker N]` sends a sticker (package/sticker
 default to 0,0 = first sticker of the first package).
+`send-sticker --to R --meaning TAG` sends a manually tagged sticker from
+`~/.config/line-chrome/stickers.json`.
+
+Manage tags with:
+
+```sh
+python3 cli.py sticker-tags set thanks --package 0 --sticker 3 --label "thank you"
+python3 cli.py sticker-tags set sorry --package 0 --sticker 7 --label "sorry"
+python3 cli.py sticker-tags show
+python3 cli.py sticker-tags remove thanks
+```
+
+Use Korean or other natural labels directly, e.g. `고마워`, `감사`, or `미안`.
+If `--meaning` is unmapped, the command fails before touching LINE with
+`reason: "meaning_not_mapped"`.
 
 Opening LINE's sticker picker requires a *trusted* user-activation gesture, so
 `send-sticker` uses macOS CoreGraphics session-event clicks inside Chrome.

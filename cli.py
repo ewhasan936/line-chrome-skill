@@ -31,6 +31,7 @@ def emit_json(data: Any) -> None:
 SKILL_DIR = Path(__file__).resolve().parent
 DEFAULT_SEL_PATH = SKILL_DIR / "selectors.json"
 USER_SEL_PATH = Path.home() / ".config" / "line-chrome" / "selectors.json"
+USER_STICKER_TAGS_PATH = Path.home() / ".config" / "line-chrome" / "stickers.json"
 EXTENSION_ID = "ophjlpahpchlmihnnnihgmmeilfjmjjc"
 EXTENSION_PREFIX = f"chrome-extension://{EXTENSION_ID}/"
 
@@ -2070,6 +2071,68 @@ def _json_get(raw: str) -> dict:
         return {}
 
 
+def _normalize_sticker_tag(tag: str) -> str:
+    return (tag or "").strip().casefold()
+
+
+def _load_sticker_tags_doc(path: Path | None = None) -> dict:
+    path = path or USER_STICKER_TAGS_PATH
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        return {"version": 1, "tags": {}}
+    except json.JSONDecodeError as e:
+        raise SkillError(f"sticker tags file at {path} has invalid JSON: {e}")
+    if not isinstance(doc, dict):
+        raise SkillError(f"sticker tags file at {path} must contain a JSON object")
+    tags = doc.setdefault("tags", {})
+    if not isinstance(tags, dict):
+        raise SkillError(f"sticker tags file at {path} must contain an object at `tags`")
+    doc.setdefault("version", 1)
+    return doc
+
+
+def _write_sticker_tags_doc(doc: dict, path: Path | None = None) -> None:
+    path = path or USER_STICKER_TAGS_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _coerce_sticker_tag_entry(tag: str, entry: Any) -> dict:
+    # Future-proof for list-valued tags; current CLI writes a single object.
+    if isinstance(entry, list):
+        entry = entry[0] if entry else {}
+    if not isinstance(entry, dict):
+        raise SkillError(f"sticker tag '{tag}' must map to an object")
+    try:
+        package_idx = int(entry["package"])
+        sticker_idx = int(entry["sticker"])
+    except (KeyError, TypeError, ValueError):
+        raise SkillError(f"sticker tag '{tag}' requires integer package and sticker values")
+    if package_idx < 0 or sticker_idx < 0:
+        raise SkillError(f"sticker tag '{tag}' has a negative package/sticker index")
+    resolved = {"tag": tag, "package": package_idx, "sticker": sticker_idx}
+    if entry.get("label"):
+        resolved["label"] = entry.get("label")
+    return resolved
+
+
+def _resolve_sticker_meaning(meaning: str, path: Path | None = None) -> dict | None:
+    doc = _load_sticker_tags_doc(path)
+    tags = doc.get("tags", {})
+    key = (meaning or "").strip()
+    if not key:
+        return None
+    if key in tags:
+        return _coerce_sticker_tag_entry(key, tags[key])
+    norm = _normalize_sticker_tag(key)
+    for tag, entry in tags.items():
+        if _normalize_sticker_tag(tag) == norm:
+            return _coerce_sticker_tag_entry(tag, entry)
+    return None
+
+
 def _parse_send_sticker_result(raw: str, package_idx: int, sticker_idx: int) -> dict:
     """Map the AppleScript sticker workflow result into the public CLI contract."""
     if raw == "ABORT_NO_TAB":
@@ -2436,13 +2499,33 @@ def _do_send_sticker(sel: dict, loc: dict, package_idx: int, sticker_idx: int) -
 
 
 def cmd_send_sticker(args, sel, sources):
-    """Send a sticker to a room. --package / --sticker pick which sticker by position
-    (defaults to the first sticker of the first package). Hot path skips navigation."""
+    """Send a sticker to a room. --meaning resolves a tagged sticker; otherwise
+    --package / --sticker pick by position (default first sticker of first package).
+    Hot path skips navigation."""
     if not args.to:
         raise SkillError("--to is required")
-    if args.package < 0 or args.sticker < 0:
+    package_arg = getattr(args, "package", None)
+    sticker_arg = getattr(args, "sticker", None)
+    meaning = (getattr(args, "meaning", None) or "").strip()
+    resolved_meaning = None
+    if meaning:
+        if package_arg is not None or sticker_arg is not None:
+            return {"ok": False, "stage": "validate",
+                    "reason": "meaning_conflicts_with_index",
+                    "meaning": meaning}
+        resolved_meaning = _resolve_sticker_meaning(meaning)
+        if not resolved_meaning:
+            return {"ok": False, "stage": "validate", "reason": "meaning_not_mapped",
+                    "meaning": meaning, "config": str(USER_STICKER_TAGS_PATH)}
+        package_idx = resolved_meaning["package"]
+        sticker_idx = resolved_meaning["sticker"]
+    else:
+        package_idx = 0 if package_arg is None else package_arg
+        sticker_idx = 0 if sticker_arg is None else sticker_arg
+
+    if package_idx < 0 or sticker_idx < 0:
         return {"ok": False, "stage": "validate", "reason": "negative_index",
-                "package": args.package, "sticker": args.sticker}
+                "package": package_idx, "sticker": sticker_idx}
     loc = _require_tab()
     t0 = time.time()
 
@@ -2467,9 +2550,14 @@ def cmd_send_sticker(args, sel, sources):
             return {"ok": False, "stage": "navigate", "reason": nav,
                     "duration_ms": int((time.time() - t0) * 1000)}
 
-    result = _do_send_sticker(sel, loc, args.package, args.sticker)
+    result = _do_send_sticker(sel, loc, package_idx, sticker_idx)
     result["room"] = args.to
     result["path"] = path
+    if resolved_meaning:
+        result["meaning"] = meaning
+        result["resolved_tag"] = resolved_meaning.get("tag")
+        if resolved_meaning.get("label"):
+            result["sticker_label"] = resolved_meaning.get("label")
     result["duration_ms"] = int((time.time() - t0) * 1000)
     return result
 
@@ -2555,6 +2643,48 @@ def cmd_selectors(args, sel, sources):
     raise SkillError(f"unknown selectors action '{args.action}'")
 
 
+def cmd_sticker_tags(args, sel, sources):
+    doc = _load_sticker_tags_doc()
+    tags = doc.setdefault("tags", {})
+    if args.action == "show":
+        return {"path": str(USER_STICKER_TAGS_PATH), "tags": tags}
+
+    tag = (args.tag or "").strip()
+    if not tag:
+        raise SkillError("`sticker-tags set/remove` requires TAG")
+
+    if args.action == "set":
+        if args.package is None or args.sticker is None:
+            raise SkillError("`sticker-tags set` requires --package and --sticker")
+        if args.package < 0 or args.sticker < 0:
+            raise SkillError("sticker package/sticker indexes must be non-negative")
+        entry = {"package": args.package, "sticker": args.sticker}
+        if args.label:
+            entry["label"] = args.label
+        tags[tag] = entry
+        _write_sticker_tags_doc(doc)
+        return {"ok": True, "updated": str(USER_STICKER_TAGS_PATH),
+                "tag": tag, **entry}
+
+    if args.action == "remove":
+        key = tag if tag in tags else None
+        if key is None:
+            norm = _normalize_sticker_tag(tag)
+            for candidate in tags:
+                if _normalize_sticker_tag(candidate) == norm:
+                    key = candidate
+                    break
+        if key is None:
+            return {"ok": False, "reason": "tag_not_found",
+                    "tag": tag, "path": str(USER_STICKER_TAGS_PATH)}
+        removed = tags.pop(key)
+        _write_sticker_tags_doc(doc)
+        return {"ok": True, "updated": str(USER_STICKER_TAGS_PATH),
+                "removed_tag": key, "removed": removed}
+
+    raise SkillError(f"unknown sticker-tags action '{args.action}'")
+
+
 def cmd_cache_info(args, sel, sources):
     profile = args.profile or "Default"
     template = _load_json(DEFAULT_SEL_PATH).get("leveldb_path_template", "")
@@ -2635,9 +2765,11 @@ def main():
 
     ss = sub.add_parser("send-sticker")
     ss.add_argument("--to", required=True, help="Room to send the sticker to.")
-    ss.add_argument("--package", type=int, default=0,
+    ss.add_argument("--meaning", "--tag", dest="meaning",
+                    help="Sticker meaning/tag from ~/.config/line-chrome/stickers.json.")
+    ss.add_argument("--package", type=int, default=None,
                     help="Sticker package index (default 0).")
-    ss.add_argument("--sticker", type=int, default=0,
+    ss.add_argument("--sticker", type=int, default=None,
                     help="Sticker index within the package (default 0).")
 
     h = sub.add_parser("history")
@@ -2658,6 +2790,14 @@ def main():
     sl.add_argument("key", nargs="?")
     sl.add_argument("value", nargs="?")
 
+    st = sub.add_parser("sticker-tags", aliases=["sticker-tag"])
+    st.set_defaults(cmd="sticker-tags")
+    st.add_argument("action", choices=["show", "set", "remove"])
+    st.add_argument("tag", nargs="?")
+    st.add_argument("--package", type=int)
+    st.add_argument("--sticker", type=int)
+    st.add_argument("--label")
+
     ci = sub.add_parser("cache-info"); ci.add_argument("--profile")
     cd = sub.add_parser("cache-dump")
     cd.add_argument("--out", required=True); cd.add_argument("--profile")
@@ -2674,6 +2814,7 @@ def main():
         "send-sticker": cmd_send_sticker,
         "watch": cmd_watch,
         "selectors": cmd_selectors,
+        "sticker-tags": cmd_sticker_tags,
         "cache-info": cmd_cache_info, "cache-dump": cmd_cache_dump,
     }
     try:

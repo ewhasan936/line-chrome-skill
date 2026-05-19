@@ -107,6 +107,8 @@ python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "meeting"
 python3 cli.py reply --room "Family" --to "see you at 6" --text "got it"
 python3 cli.py send-sticker --to "Family"   # see "Stickers" below
+python3 cli.py send-sticker --to "Family" --meaning thanks
+python3 cli.py sticker-tags set thanks --package 0 --sticker 3 --label "thank you"
 python3 cli.py leave-group --room "Old Group" --confirm   # irreversible — see below
 python3 cli.py watch --interval 5         # poll for new messages (Ctrl-C to stop)
 
@@ -151,6 +153,23 @@ replied to; if several match, the most recent one is used. Completes in roughly
 
 `send-sticker --to R [--package N] [--sticker N]` sends a sticker, addressed by
 package/sticker index (default `0 0` — the first sticker of the first package).
+`send-sticker --to R --meaning TAG` sends a tagged sticker from
+`~/.config/line-chrome/stickers.json`.
+
+Create or update tags with:
+
+```sh
+python3 cli.py sticker-tags set thanks --package 0 --sticker 3 --label "thank you"
+python3 cli.py sticker-tags set sorry --package 0 --sticker 7 --label "sorry"
+python3 cli.py sticker-tags show
+python3 cli.py sticker-tags remove thanks
+```
+
+Tags are exact labels you choose, so Korean tags such as `고마워`, `감사`, or `미안`
+work the same way. If `--meaning` is not mapped, the command returns
+`{"ok": false, "reason": "meaning_not_mapped"}` before touching Chrome or LINE.
+For LINE character stickers, first pick the package/sticker indexes from your own
+picker order, then tag them, for example `미안해`, `고마워`, or `축하`.
 
 Opening LINE's sticker picker requires a *trusted* user-activation gesture, so
 `send-sticker` uses macOS CoreGraphics session-event clicks in Chrome. Grant

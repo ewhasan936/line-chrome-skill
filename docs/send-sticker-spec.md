@@ -4,7 +4,13 @@
 
 `python3 cli.py send-sticker --to ROOM [--package N] [--sticker N]`
 
-- Sends the sticker at package index `N` and sticker index `N`; both default to `0`.
+`python3 cli.py send-sticker --to ROOM --meaning TAG`
+
+- Sends the sticker at package index `--package` and sticker index `--sticker`;
+  both default to `0`.
+- Resolves `--meaning TAG` through `~/.config/line-chrome/stickers.json`.
+  `--meaning` is mutually exclusive with explicit `--package`/`--sticker`.
+- Manages manual tags with `sticker-tags set/show/remove`.
 - Uses the existing hot/cold room behavior:
   - hot: if the current chat header matches `--to`, send without navigation.
   - cold: otherwise search for `--to`, open the room, then send.
@@ -28,6 +34,7 @@ Required fields:
 - `sticker`
 - `trusted_input: "core_graphics"`
 - `sticker_bubbles: [before, after]` where `after > before`
+- Optional when `--meaning` is used: `meaning`, `resolved_tag`, `sticker_label`
 
 The live integration target is under `1000ms` for both hot and cold paths.
 
@@ -36,6 +43,10 @@ The live integration target is under `1000ms` for both hot and cold paths.
 - Missing `--to`: argparse error, exit code `2`.
 - Negative `--package` or `--sticker`: `ok: false`, `stage: "validate"`,
   `reason: "negative_index"`; must happen before Chrome/LINE access.
+- `--meaning` combined with `--package` or `--sticker`: `ok: false`,
+  `stage: "validate"`, `reason: "meaning_conflicts_with_index"`.
+- Unmapped `--meaning`: `ok: false`, `stage: "validate"`,
+  `reason: "meaning_not_mapped"`; must happen before Chrome/LINE access.
 - No Chrome extension tab: `stage: "locate_tab"`.
 - Sticker button missing or hidden: `stage: "open_picker"`.
 - Accessibility/CoreGraphics click unavailable: `stage: "trusted_click"`,
@@ -68,6 +79,10 @@ Always-runnable contract tests: `tests/test_send_sticker_contract.py`
 - Map unknown workflow responses to `unknown`.
 - Reject negative package index before Chrome access.
 - Reject negative sticker index before Chrome access.
+- Reject unmapped meanings before Chrome access.
+- Reject `--meaning` combined with explicit indexes.
+- Resolve mapped meanings to package/sticker indexes.
+- Set, show, resolve, and remove manual sticker tags.
 
 Live integration tests: `tests/test_reply_sticker.py` with `LINE_TEST_ROOM`.
 Use `LINE_TEST_ONLY=sticker` to run only the sticker matrix against the configured

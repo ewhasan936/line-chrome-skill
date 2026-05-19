@@ -105,6 +105,8 @@ python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "회의"
 python3 cli.py reply --room "Family" --to "6시에 보자" --text "알겠어"
 python3 cli.py send-sticker --to "Family"   # 아래 "스티커" 참고
+python3 cli.py send-sticker --to "Family" --meaning thanks
+python3 cli.py sticker-tags set thanks --package 0 --sticker 3 --label "고마워"
 python3 cli.py leave-group --room "Old Group" --confirm   # 되돌릴 수 없음 — 아래 참고
 python3 cli.py watch --interval 5         # 새 메시지 폴링 (Ctrl-C로 중지)
 
@@ -149,6 +151,23 @@ System Events로 `보기 → 개발자 정보 → Apple Events의 자바스크�
 
 `send-sticker --to R [--package N] [--sticker N]` — 패키지/스티커 인덱스로 지정해
 스티커를 보냅니다 (기본 `0 0` = 첫 패키지의 첫 스티커).
+`send-sticker --to R --meaning TAG`는 `~/.config/line-chrome/stickers.json`에 저장된
+태그 스티커를 보냅니다.
+
+태그 생성/수정 예:
+
+```sh
+python3 cli.py sticker-tags set thanks --package 0 --sticker 3 --label "고마워"
+python3 cli.py sticker-tags set sorry --package 0 --sticker 7 --label "미안"
+python3 cli.py sticker-tags show
+python3 cli.py sticker-tags remove thanks
+```
+
+태그는 사용자가 정하는 문자열이라 `고마워`, `감사`, `미안` 같은 한국어 태그도 그대로
+쓸 수 있습니다. `--meaning`이 매핑되어 있지 않으면 Chrome이나 LINE을 건드리기 전에
+`{"ok": false, "reason": "meaning_not_mapped"}`를 반환합니다.
+LINE 캐릭터 스티커도 본인의 피커 순서에서 패키지/스티커 인덱스를 먼저 확인한 뒤
+`미안해`, `고마워`, `축하` 같은 의미 태그로 등록해 사용할 수 있습니다.
 
 LINE 스티커 피커를 여는 것은 *신뢰된(trusted)* 사용자 활성화 제스처를 요구하므로,
 `send-sticker`는 macOS CoreGraphics 세션 이벤트로 Chrome 안을 OS 레벨 클릭합니다.

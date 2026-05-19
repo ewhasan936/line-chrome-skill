@@ -107,6 +107,8 @@ python3 cli.py history --room "Family" --limit 50
 python3 cli.py search --room "Family" --query "会議"
 python3 cli.py reply --room "Family" --to "6時に会おう" --text "了解"
 python3 cli.py send-sticker --to "Family"   # 下記「ステッカー」参照
+python3 cli.py send-sticker --to "Family" --meaning thanks
+python3 cli.py sticker-tags set thanks --package 0 --sticker 3 --label "ありがとう"
 python3 cli.py leave-group --room "Old Group" --confirm   # 取り消し不可 — 下記参照
 python3 cli.py watch --interval 5         # 新着メッセージをポーリング (Ctrl-C で停止)
 
@@ -151,6 +153,24 @@ Events 経由で `表示 → デベロッパー → Apple Events からの JavaS
 
 `send-sticker --to R [--package N] [--sticker N]` — パッケージ/ステッカーのインデックス
 で指定してステッカーを送ります（既定は `0 0` = 最初のパッケージの最初のステッカー）。
+`send-sticker --to R --meaning TAG` は `~/.config/line-chrome/stickers.json` に保存した
+タグ付きステッカーを送ります。
+
+タグの作成/更新例:
+
+```sh
+python3 cli.py sticker-tags set thanks --package 0 --sticker 3 --label "ありがとう"
+python3 cli.py sticker-tags set sorry --package 0 --sticker 7 --label "ごめん"
+python3 cli.py sticker-tags show
+python3 cli.py sticker-tags remove thanks
+```
+
+タグはユーザーが決める文字列なので、`ありがとう`、`感謝`、`ごめん` などもそのまま使えます。
+`--meaning` が未登録なら Chrome や LINE に触れる前に
+`{"ok": false, "reason": "meaning_not_mapped"}` を返します。
+LINE キャラクターのステッカーも、自分のピッカー順でパッケージ/ステッカーの
+インデックスを確認してから `ごめん`、`ありがとう`、`おめでとう` などのタグで
+登録できます。
 
 LINE のステッカーピッカーを開くには *信頼された (trusted)* ユーザー
 アクティベーションのジェスチャーが必要なため、`send-sticker` は macOS CoreGraphics
